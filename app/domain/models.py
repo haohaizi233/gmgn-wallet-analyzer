@@ -103,6 +103,8 @@ class AnalysisOptions:
     autofill_missing: bool = True
     save_raw_json: bool = True
     pumpfun_only: bool = False
+    collection_mode: str = "api"
+    browser_headed: bool = True
 
 
 @dataclass
@@ -144,6 +146,7 @@ class TradeRecord:
     actual_quote_amount: Optional[Decimal] = None
     equivalent_sol_amount: Optional[Decimal] = None
     total_supply_at_trade: Optional[Decimal] = None
+    market_cap: Optional[Decimal] = None
     amount_status: FieldStatus = FieldStatus.KNOWN
     cost_usd_status: FieldStatus = FieldStatus.API_MISSING
     cost_sol_status: FieldStatus = FieldStatus.API_MISSING

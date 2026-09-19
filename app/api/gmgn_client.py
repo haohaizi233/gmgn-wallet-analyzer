@@ -199,6 +199,33 @@ class GMGNClient:
             json_body={"chain": chain, "period": period, "wallet_addresses": wallets},
         )
 
+    def get_wallet_holdings(
+        self,
+        chain: str,
+        wallet_address: str,
+        *,
+        cursor: Optional[str] = None,
+        limit: int = 50,
+        hide_airdrop: bool = False,
+        hide_closed: bool = False,
+        hide_abnormal: bool = False,
+        order_by: str = "last_active_timestamp",
+        direction: str = "desc",
+    ) -> dict[str, Any]:
+        query: dict[str, Any] = {
+            "chain": chain,
+            "wallet_address": wallet_address,
+            "limit": min(50, max(1, limit)),
+            "order_by": order_by,
+            "direction": direction,
+            "hide_airdrop": str(bool(hide_airdrop)).lower(),
+            "hide_closed": str(bool(hide_closed)).lower(),
+            "hide_abnormal": str(bool(hide_abnormal)).lower(),
+        }
+        if cursor:
+            query["cursor"] = cursor
+        return self._request("GET", "/v1/user/wallet_holdings", "wallet_holdings", query)
+
     def get_token_info(self, chain: str, address: str) -> dict[str, Any]:
         key = f"token_info|{chain}|{address}"
         return self.singleflight.do(key, lambda: self._request("GET", "/v1/token/info", "token_info", {"chain": chain, "address": address}))

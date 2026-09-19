@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
 import sys
+import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -17,4 +19,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    multiprocessing.freeze_support()
+    try:
+        main()
+    except Exception:
+        detail = traceback.format_exc()
+        try:
+            from tkinter import messagebox
+
+            messagebox.showerror("启动失败", detail[-2000:])
+        except Exception:
+            sys.stderr.write(detail)
+        raise

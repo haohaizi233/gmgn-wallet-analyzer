@@ -308,6 +308,24 @@ class DirectionAndQuoteTests(unittest.TestCase):
         self.assertEqual(swaps[0].sold.symbol, "USDC")
         self.assertEqual(swaps[0].total_value_usd, Decimal("50"))
 
+    def test_jupiter_wrap_leftover_wsol_is_buy(self):
+        wsol = "So11111111111111111111111111111111111111112"
+        tx = HistoryTx(
+            signature="jup1",
+            timestamp=10,
+            tx_type="SWAP",
+            balance_changes=[
+                BalanceChange(mint="TokenA", amount=Decimal("100"), decimals=6),
+                BalanceChange(mint="SOL", amount=Decimal("-0.2"), decimals=9),
+                BalanceChange(mint=wsol, amount=Decimal("1.5"), decimals=9),
+            ],
+        )
+        self.assertEqual(classify_token_event(tx, "TokenA"), "buy")
+        swaps = history_to_swaps(WALLET, [tx])
+        self.assertEqual(len(swaps), 1)
+        self.assertEqual(swaps[0].transaction_type, "buy")
+        self.assertEqual(swaps[0].sold.symbol, "SOL")
+
 
 class WarmCacheTests(unittest.TestCase):
     def test_merge_keeps_old_and_new(self):

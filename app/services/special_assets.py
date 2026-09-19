@@ -7,9 +7,9 @@ from typing import Optional
 
 from app.domain.enums import AcquisitionType
 from app.domain.models import TokenInfo
-from app.utils.paths import PROJECT_ROOT
+from app.utils.paths import data_file
 
-REGISTRY_PATH = PROJECT_ROOT / "data" / "special_assets.json"
+REGISTRY_PATH = data_file("special_assets.json")
 
 
 @dataclass(frozen=True)

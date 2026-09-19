@@ -6,6 +6,7 @@ from tkinter import filedialog
 import customtkinter as ctk
 
 from app.gui.theme import MUTED, PANEL, TEXT, font
+from app.utils.paths import LOG_DIR
 
 LEVEL_COLORS = {
     "DEBUG": "#6B7280",
@@ -73,7 +74,7 @@ class LogPanel(ctk.CTkFrame):
         self.text.configure(state="disabled")
 
     def export(self) -> None:
-        path = filedialog.asksaveasfilename(defaultextension=".log", filetypes=[("Log", "*.log"), ("Text", "*.txt")])
+        path = filedialog.asksaveasfilename(initialdir=str(LOG_DIR), defaultextension=".log", filetypes=[("Log", "*.log"), ("Text", "*.txt")])
         if not path:
             return
         content = self.text.get("1.0", "end")

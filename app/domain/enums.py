@@ -11,6 +11,11 @@ class ReportPeriod(str, Enum):
     CUSTOM = "custom"
 
 
+class CollectionMode(str, Enum):
+    AUTOMATION = "automation"
+    API = "api"
+
+
 class EventType(str, Enum):
     BUY = "buy"
     SELL = "sell"
@@ -109,6 +114,7 @@ class ProviderCapability(str, Enum):
     WALLET_HISTORY = "WALLET_HISTORY"
     WALLET_TRANSFERS = "WALLET_TRANSFERS"
     WALLET_BALANCES = "WALLET_BALANCES"
+    WALLET_HOLDINGS = "WALLET_HOLDINGS"
     TOKEN_METADATA = "TOKEN_METADATA"
     TOKEN_MARKET = "TOKEN_MARKET"
     TOKEN_POOLS = "TOKEN_POOLS"

@@ -17,6 +17,8 @@ def _min_trade(trades: list[TradeRecord], event: EventType) -> Optional[TradeRec
 
 
 def _market_cap(trade: TradeRecord, info: Optional[TokenInfo]) -> tuple[Optional[Decimal], bool, str]:
+    if trade.market_cap is not None and trade.market_cap > 0:
+        return trade.market_cap, False, "wallet_activity.market_cap"
     supply = trade.total_supply_at_trade
     source = "activity.token.total_supply"
     estimated = False

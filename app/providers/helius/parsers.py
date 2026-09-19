@@ -77,6 +77,30 @@ def parse_history_page(payload: Any) -> tuple[list[HistoryTx], Optional[str], bo
     return txs, (str(cursor) if cursor else None), has_more
 
 
+def _is_sol_mint(mint: str) -> bool:
+    return mint in SOL_ALIASES or mint == "SOL"
+
+
+def _quote_direction(quote_legs: dict[str, Decimal]) -> tuple[Decimal, bool, bool]:
+    """Net SOL/WSOL plus whether any quote left / entered the wallet.
+
+    Jupiter wrap/unwrap leaves leftover WSOL in the same tx as a native SOL
+    spend. Using the single max-abs quote leg then classified those as
+    unknown_swap and dropped the buy.
+    """
+    sol_net = Decimal("0")
+    any_down = False
+    any_up = False
+    for mint, amount in quote_legs.items():
+        if _is_sol_mint(mint):
+            sol_net += amount
+        if amount < 0:
+            any_down = True
+        elif amount > 0:
+            any_up = True
+    return sol_net, any_down, any_up
+
+
 def classify_token_event(tx: HistoryTx, mint: str) -> str:
     token_delta = Decimal("0")
     quote_legs: dict[str, Decimal] = {}
@@ -91,17 +115,11 @@ def classify_token_event(tx: HistoryTx, mint: str) -> str:
             quote_legs[change.mint] = quote_legs.get(change.mint, Decimal("0")) + change.amount
     if not saw_token:
         return "none"
-    quote_delta = Decimal("0")
-    if quote_legs:
-        quote_delta = max(quote_legs.values(), key=lambda v: abs(v))
-    if token_delta > 0 and quote_delta < 0:
+    _sol_net, any_quote_down, any_quote_up = _quote_direction(quote_legs)
+    if token_delta > 0 and any_quote_down:
         return "buy"
-    if token_delta < 0 and quote_delta > 0:
+    if token_delta < 0 and any_quote_up:
         return "sell"
-    if token_delta > 0 and quote_delta > 0:
-        return "unknown_swap"
-    if token_delta < 0 and quote_delta < 0:
-        return "unknown_swap"
     if token_delta > 0:
         return "transfer_in"
     if token_delta < 0:
@@ -118,7 +136,32 @@ QUOTE_SYMBOLS = {
 }
 
 
-def _quote_leg_from_changes(tx: HistoryTx, token_mint: str) -> SwapLeg:
+def _dominant_quote(quotes: dict[str, Decimal], kind: str) -> tuple[str, Decimal]:
+    if not quotes:
+        return "", Decimal("0")
+    sol_net = sum((amt for mint, amt in quotes.items() if _is_sol_mint(mint)), Decimal("0"))
+    stables = {mint: amt for mint, amt in quotes.items() if not _is_sol_mint(mint)}
+    prefer_out = kind in {"buy", "transfer_in"}
+    if prefer_out:
+        if sol_net < 0:
+            return "SOL", sol_net
+        downs = {mint: amt for mint, amt in stables.items() if amt < 0}
+        if downs:
+            return max(downs.items(), key=lambda kv: abs(kv[1]))
+        if sol_net != 0:
+            return "SOL", sol_net
+    else:
+        if sol_net > 0:
+            return "SOL", sol_net
+        ups = {mint: amt for mint, amt in stables.items() if amt > 0}
+        if ups:
+            return max(ups.items(), key=lambda kv: abs(kv[1]))
+        if sol_net != 0:
+            return "SOL", sol_net
+    return max(quotes.items(), key=lambda kv: abs(kv[1]))
+
+
+def _quote_leg_from_changes(tx: HistoryTx, token_mint: str, kind: str = "") -> SwapLeg:
     quotes: dict[str, Decimal] = {}
     for change in tx.balance_changes:
         if change.amount is None:
@@ -129,13 +172,13 @@ def _quote_leg_from_changes(tx: HistoryTx, token_mint: str) -> SwapLeg:
             quotes[change.mint] = quotes.get(change.mint, Decimal("0")) + change.amount
     if not quotes:
         return SwapLeg()
-    mint_q, amt = max(quotes.items(), key=lambda kv: abs(kv[1]))
-    symbol = QUOTE_SYMBOLS.get(mint_q, mint_q[:4])
+    mint_q, amt = _dominant_quote(quotes, kind)
+    symbol = QUOTE_SYMBOLS.get(mint_q, mint_q[:4] if mint_q else "")
     address = WSOL if mint_q in SOL_ALIASES or mint_q == "SOL" else mint_q
     if mint_q == "SOL":
         address = WSOL
         symbol = "SOL"
-    return SwapLeg(address=address, symbol=symbol, amount=abs(amt))
+    return SwapLeg(address=address, symbol=symbol, amount=abs(amt) if amt is not None else None)
 
 
 def history_to_swaps(wallet: str, txs: list[HistoryTx], sol_usd: Decimal | None = None) -> list[WalletSwap]:
@@ -151,7 +194,7 @@ def history_to_swaps(wallet: str, txs: list[HistoryTx], sol_usd: Decimal | None 
                 continue
             token_amt = sum((c.amount for c in tx.balance_changes if c.mint == mint and c.amount is not None), Decimal("0"))
             token_leg = SwapLeg(address=mint, amount=abs(token_amt) if token_amt is not None else None)
-            quote_leg = _quote_leg_from_changes(tx, mint)
+            quote_leg = _quote_leg_from_changes(tx, mint, kind)
             if kind in {"buy", "transfer_in"}:
                 bought, sold = token_leg, quote_leg
             else:

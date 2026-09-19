@@ -7,6 +7,7 @@ DEFAULT_PRIORITY: dict[ProviderCapability, list[str]] = {
     ProviderCapability.WALLET_HISTORY: ["moralis", "solana_rpc", "helius"],
     ProviderCapability.WALLET_TRANSFERS: ["solana_rpc", "helius", "gmgn"],
     ProviderCapability.WALLET_BALANCES: ["solana_rpc", "helius", "moralis"],
+    ProviderCapability.WALLET_HOLDINGS: ["gmgn", "solana_rpc", "helius"],
     ProviderCapability.TRANSACTION_DETAIL: ["solana_rpc", "helius"],
     ProviderCapability.TOKEN_METADATA: ["moralis", "helius", "solana_rpc", "gmgn"],
     ProviderCapability.TOKEN_MARKET: [

@@ -12,6 +12,13 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _parse_collection_mode(value: str | None) -> str:
+    text = (value or "automation").strip().lower()
+    if text in {"api", "openapi", "key"}:
+        return "api"
+    return "automation"
+
+
 def _truthy(value: str | None, default: bool = True) -> bool:
     if value is None:
         return default
@@ -52,6 +59,9 @@ class AppConfig:
     helius_target_rps: float = 8.0
     helius_monthly_credit_budget: int = 1_000_000
     helius_api_workers: int = 4
+    collection_mode: str = "automation"
+    browser_headed: bool = True
+    gmgn_qr_login_timeout: float = 180.0
 
     @property
     def has_api_key(self) -> bool:
@@ -188,6 +198,9 @@ def load_config() -> AppConfig:
         helius_target_rps=float(values.get("HELIUS_TARGET_RPS") or 8),
         helius_monthly_credit_budget=int(values.get("HELIUS_MONTHLY_CREDIT_BUDGET") or 1_000_000),
         helius_api_workers=max(1, min(8, int(values.get("HELIUS_API_WORKERS") or 4))),
+        collection_mode=_parse_collection_mode(values.get("GMGN_COLLECTION_MODE")),
+        browser_headed=_truthy(values.get("GMGN_BROWSER_HEADED"), True),
+        gmgn_qr_login_timeout=float(values.get("GMGN_QR_LOGIN_TIMEOUT") or 180),
     )
 
 

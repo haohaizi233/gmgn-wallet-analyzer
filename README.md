@@ -71,6 +71,23 @@ python main.py
 
 窗口约 1500×920，最小 1200×760。
 
+打包成独立程序（不装 Python 也能跑）：
+
+```bat
+scripts\build_exe.bat
+```
+
+产物在 `dist\GMGNWallet\`。把整个文件夹一起拷贝。exe 旁边的目录才是给用户改的：
+
+| 路径 | 用途 |
+|---|---|
+| `.env` | 现有配置作为默认（API Key）。已有文件不会被覆盖 |
+| `input\地址.txt` | 钱包地址，一行一个 |
+| `output\` | Excel 导出 |
+| `logs\` | 运行日志 |
+
+不要只拷贝 exe，`_internal` 必须同级。
+
 ## 7. GUI 功能
 
 | 页面 | 说明 |

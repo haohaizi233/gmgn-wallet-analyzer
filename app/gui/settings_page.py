@@ -9,6 +9,7 @@ from app.api.exceptions import GMGNError
 from app.api.gmgn_client import GMGNClient
 from app.config import load_config, save_api_settings
 from app.gui.theme import BG, MUTED, PANEL, TEXT, font
+from app.utils.paths import APP_DIR, COOKIE_DIR, ENV_PATH, INPUT_DIR, LOG_DIR, OUTPUT_DIR, default_wallet_file, open_in_explorer
 
 
 class SettingsPage(ctk.CTkFrame):
@@ -124,6 +125,59 @@ class SettingsPage(ctk.CTkFrame):
         self.source_status = ctk.CTkLabel(src_btns, text="Solana RPC 主路径 · Helius 可选增强 · DEX 无需 Key · Moralis 可选", font=font(12), text_color=MUTED)
         self.source_status.pack(side="left", padx=10)
 
+        cookies = ctk.CTkFrame(scroll, fg_color=PANEL)
+        cookies.pack(fill="x", padx=24, pady=(0, 24))
+        ctk.CTkLabel(cookies, text="GMGN Cookie 号池", font=font(18, "bold"), text_color=TEXT, anchor="w").pack(fill="x", padx=20, pady=(16, 4))
+        ctk.CTkLabel(
+            cookies,
+            text="自动化采集会复用已保存的登录态。全部失效时自动弹出有头窗口扫码，成功后写回号池。不要手工粘贴 Cookie 字符串。",
+            font=font(12),
+            text_color=MUTED,
+            anchor="w",
+            wraplength=900,
+        ).pack(fill="x", padx=20)
+        self.cookie_table = ctk.CTkLabel(cookies, text=self._cookie_status_text(), font=font(12), text_color=MUTED, anchor="w", justify="left")
+        self.cookie_table.pack(fill="x", padx=20, pady=8)
+        ck_btns = ctk.CTkFrame(cookies, fg_color="transparent")
+        ck_btns.pack(fill="x", padx=20, pady=(0, 16))
+        ctk.CTkButton(ck_btns, text="扫码登录（加入号池）", width=160, command=self.qr_login).pack(side="left")
+        ctk.CTkButton(ck_btns, text="清理失效 Cookie", width=130, fg_color="#E5E7EB", text_color=TEXT, command=self.purge_cookies).pack(side="left", padx=8)
+        ctk.CTkButton(ck_btns, text="打开 Cookie 目录", width=130, fg_color="#E5E7EB", text_color=TEXT, command=lambda: open_in_explorer(COOKIE_DIR)).pack(side="left")
+        self.cookie_status = ctk.CTkLabel(ck_btns, text="", font=font(12), text_color=MUTED)
+        self.cookie_status.pack(side="left", padx=10)
+
+        paths_card = ctk.CTkFrame(scroll, fg_color=PANEL)
+        paths_card.pack(fill="x", padx=24, pady=(0, 24))
+        ctk.CTkLabel(paths_card, text="本机目录", font=font(18, "bold"), text_color=TEXT, anchor="w").pack(fill="x", padx=20, pady=(16, 4))
+        ctk.CTkLabel(
+            paths_card,
+            text="打包成 exe 后，配置、地址 txt、Excel 都在程序旁边的文件夹，不会写进临时解压目录。",
+            font=font(12),
+            text_color=MUTED,
+            anchor="w",
+            wraplength=900,
+        ).pack(fill="x", padx=20)
+        ctk.CTkLabel(
+            paths_card,
+            text=(
+                f"默认地址文件：{default_wallet_file()}\n"
+                f"Excel 输出：{OUTPUT_DIR}\n"
+                f"运行目录：{APP_DIR}\n"
+                f"配置文件：{ENV_PATH}\n"
+                f"日志目录：{LOG_DIR}"
+            ),
+            font=font(12),
+            text_color=TEXT,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=20, pady=8)
+        path_btns = ctk.CTkFrame(paths_card, fg_color="transparent")
+        path_btns.pack(fill="x", padx=20, pady=(0, 16))
+        ctk.CTkButton(path_btns, text="打开运行目录", width=110, fg_color="#E5E7EB", text_color=TEXT, command=lambda: open_in_explorer(APP_DIR)).pack(side="left")
+        ctk.CTkButton(path_btns, text="打开输入目录", width=110, fg_color="#E5E7EB", text_color=TEXT, command=lambda: open_in_explorer(INPUT_DIR)).pack(side="left", padx=8)
+        ctk.CTkButton(path_btns, text="打开输出目录", width=110, fg_color="#E5E7EB", text_color=TEXT, command=lambda: open_in_explorer(OUTPUT_DIR)).pack(side="left")
+        ctk.CTkButton(path_btns, text="打开日志目录", width=110, fg_color="#E5E7EB", text_color=TEXT, command=lambda: open_in_explorer(LOG_DIR)).pack(side="left", padx=8)
+
     def _util_label(self, value: float) -> str:
         if value <= 0.62:
             return "保守 60%"
@@ -169,6 +223,61 @@ class SettingsPage(ctk.CTkFrame):
             )
         return "\n".join(lines)
 
+    def _cookie_status_text(self) -> str:
+        try:
+            from app.browser.cookie_pool import CookiePool
+
+            pool = CookiePool()
+            rows = pool.all()
+        except Exception as exc:
+            return f"号池读取失败：{exc}"
+        if not rows:
+            return f"号池为空。目录：{COOKIE_DIR}"
+        lines = [f"共 {len(rows)} 个账号，可用 {len(pool.usable())} 个（必须含登录 Cookie）"]
+        for item in rows:
+            lines.append(f"{item.id}  {item.state}  失败={item.fail_count}")
+        return "\n".join(lines)
+
+    def qr_login(self) -> None:
+        self.cookie_status.configure(text="正在打开有头浏览器，请扫码…")
+
+        def work():
+            try:
+                from app.browser.cookie_pool import CookiePool
+                from app.browser.session import BrowserSession
+
+                session = BrowserSession(
+                    CookiePool(),
+                    headed=True,
+                    on_event=lambda m: self.after(0, lambda msg=m: self.cookie_status.configure(text=msg)),
+                )
+                try:
+                    account = session.login_new_account()
+                    account_id = account.id
+                    self.after(0, lambda: self._qr_ok(account_id))
+                finally:
+                    session.close()
+            except Exception as exc:
+                self.after(0, lambda: self._qr_fail(str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _qr_ok(self, account_id: str) -> None:
+        self.cookie_table.configure(text=self._cookie_status_text())
+        self.cookie_status.configure(text=f"已加入号池 {account_id}")
+        messagebox.showinfo("扫码登录", f"Cookie 已保存：{account_id}")
+
+    def _qr_fail(self, message: str) -> None:
+        self.cookie_status.configure(text="扫码失败")
+        messagebox.showerror("扫码登录失败", message)
+
+    def purge_cookies(self) -> None:
+        from app.browser.cookie_pool import CookiePool
+
+        removed = CookiePool().purge_expired()
+        self.cookie_table.configure(text=self._cookie_status_text())
+        self.cookie_status.configure(text=f"已清理 {removed} 个失效 Cookie")
+
     def _plan_changed(self, value: str) -> None:
         mapping = {"Free": ("5", "5"), "Plus": ("20", "20"), "Pro": ("50", "50")}
         rate, cap = mapping.get(value, ("5", "5"))
@@ -210,6 +319,8 @@ class SettingsPage(ctk.CTkFrame):
                 "VERIFICATION_MODE": self.mode_var.get().strip() or "BALANCED",
                 "ENABLE_GMGN": "true",
                 "ENABLE_GMGN_DEEP_HISTORY_FALLBACK": "false",
+                "GMGN_COLLECTION_MODE": getattr(self.app.config, "collection_mode", "automation") or "automation",
+                "GMGN_BROWSER_HEADED": "true" if getattr(self.app.config, "browser_headed", True) else "false",
             },
         )
         self.app.reload_config()

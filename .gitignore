@@ -16,8 +16,12 @@ __pycache__/
 data/*.db
 data/*.db-*
 data/raw/
+data/cookies/
 logs/
 output/
+input/
+dist/
+build/
 *.pem
 .DS_Store
 Thumbs.db

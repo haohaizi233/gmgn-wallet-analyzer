@@ -125,11 +125,23 @@ class WalletAnalysisService:
 
         self.repos.upsert_task(task_id, request.wallet_address, TaskStatus.RUNNING.value)
         self.repos.save_wallet_task(wallet_task_id, job_id, request.wallet_address, TaskStatus.RUNNING.value, current_stage="history")
+        cookie_mode = bool(getattr(self.client, "cookie_mode", False))
         self._progress("activity", "采集报告周期交易", 0, 0, request.wallet_address, "")
         swap_index: WalletSwapIndex | None = None
         metadata_map: dict[str, TokenMetadata] = {}
         pool_map: dict = {}
-        if self.orchestrator is not None:
+        extra_mints: list[str] = []
+        gmgn_future_stats = None
+        gmgn_future_profit = None
+        aux_pool: ThreadPoolExecutor | None = None
+
+        if cookie_mode:
+            logger.info("自动化采集：跳过 Helius 主历史，先走 GMGN 网页")
+            self._progress("browser", "正在打开 GMGN 并采集钱包页", 0, 0, request.wallet_address, "")
+            prepare = getattr(self.client, "prepare_wallet", None)
+            if prepare:
+                prepare(request.chain, request.wallet_address)
+        elif self.orchestrator is not None:
             try:
                 swap_index = self.orchestrator.collect_wallet_swaps(
                     request.wallet_address,
@@ -141,15 +153,25 @@ class WalletAnalysisService:
                 logger.warning("多数据源采集失败: %s", exc)
                 swap_index = None
 
-        gmgn_future_stats = None
-        gmgn_future_profit = None
-        aux_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gmgn-aux")
-        try:
-            gmgn_future_stats = aux_pool.submit(self._load_stats, request)
-            gmgn_future_profit = aux_pool.submit(self._load_profit, request)
-        except Exception:
-            gmgn_future_stats = None
-            gmgn_future_profit = None
+        if cookie_mode:
+            stats = self._load_stats(request)
+            profit = self._load_profit(request)
+        else:
+            aux_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gmgn-aux")
+            try:
+                gmgn_future_stats = aux_pool.submit(self._load_stats, request)
+                gmgn_future_profit = aux_pool.submit(self._load_profit, request)
+            except Exception:
+                gmgn_future_stats = None
+                gmgn_future_profit = None
+
+        if self.orchestrator is not None and not cookie_mode:
+            self._progress("universe", "补全当前持仓与官方代币名单", 0, 0, request.wallet_address, "")
+            try:
+                extra_mints = self.orchestrator.expand_token_universe(request.wallet_address, request.chain)
+            except Exception as exc:
+                logger.warning("代币宇宙补全失败，继续用流水名单: %s", exc)
+                extra_mints = []
 
         if swap_index is not None:
             lifetime = list(swap_index.swaps)
@@ -165,11 +187,19 @@ class WalletAnalysisService:
             pages = swap_index.pages
             truncated = bool(request.max_transactions and len(lifetime) >= request.max_transactions)
             token_ids = list(dict.fromkeys(s.token_address for s in report_swaps if s.token_address))
-            if swap_index.coverage and swap_index.coverage.verified_empty:
+            if extra_mints:
+                token_ids = list(dict.fromkeys(list(token_ids) + extra_mints))
+            if swap_index.coverage and swap_index.coverage.verified_empty and not extra_mints:
                 token_ids = []
                 report_trades = []
-            logger.info("钱包级索引 Token=%s pages=%s complete=%s", len(token_ids), pages, bool(swap_index.complete))
-        elif self.orchestrator is None or self.deep_gmgn_history:
+            logger.info(
+                "钱包级索引 Token=%s extra=%s pages=%s complete=%s",
+                len(token_ids),
+                len(extra_mints),
+                pages,
+                bool(swap_index.complete),
+            )
+        elif cookie_mode or self.orchestrator is None or self.deep_gmgn_history:
             try:
                 report_trades, pages, truncated = self.collector.collect_report_window(
                     request.chain,
@@ -183,9 +213,13 @@ class WalletAnalysisService:
                 logger.warning("GMGN 活动采集限流，继续无 GMGN 历史: %s", exc)
                 report_trades, pages, truncated = [], 0, False
             token_ids = self._token_ids(report_trades)
+            if extra_mints:
+                token_ids = list(dict.fromkeys(list(token_ids) + extra_mints))
+            if cookie_mode:
+                logger.info("网页采集 Token=%s trades=%s pages=%s", len(token_ids), len(report_trades), pages)
         else:
             report_trades, pages, truncated = [], 0, False
-            token_ids = []
+            token_ids = list(dict.fromkeys(extra_mints))
             logger.warning("无可用核心历史且未启用 GMGN deep history，不把空结果当成 verified empty")
         if self.orchestrator is not None and token_ids:
             self._progress("metadata", f"批量 Token Metadata {len(token_ids)}", 0, len(token_ids), request.wallet_address, "")
@@ -198,20 +232,23 @@ class WalletAnalysisService:
             except Exception as exc:
                 logger.warning("DEX batch 失败: %s", exc)
         self._stamp_trade_symbols(report_trades, metadata_map, pool_map)
-        try:
-            stats = gmgn_future_stats.result() if gmgn_future_stats else self._load_stats(request)
-            profit = gmgn_future_profit.result() if gmgn_future_profit else self._load_profit(request)
-        except Exception as exc:
-            logger.warning("GMGN 辅助统计失败，主流程继续: %s", exc)
-            stats = GmgnWalletStats(request.wallet_address, gmgn_stats_period(request.period), status=FieldStatus.ERROR, reason=str(exc))
-            profit = GmgnProfit(request.wallet_address, request.period.value, status=FieldStatus.ERROR, reason=str(exc))
-        finally:
-            aux_pool.shutdown(wait=False)
+        if not cookie_mode:
+            try:
+                stats = gmgn_future_stats.result() if gmgn_future_stats else self._load_stats(request)
+                profit = gmgn_future_profit.result() if gmgn_future_profit else self._load_profit(request)
+            except Exception as exc:
+                logger.warning("GMGN 辅助统计失败，主流程继续: %s", exc)
+                stats = GmgnWalletStats(request.wallet_address, gmgn_stats_period(request.period), status=FieldStatus.ERROR, reason=str(exc))
+                profit = GmgnProfit(request.wallet_address, request.period.value, status=FieldStatus.ERROR, reason=str(exc))
+            finally:
+                if aux_pool is not None:
+                    aux_pool.shutdown(wait=False)
         self.repos.upsert_task(task_id, request.wallet_address, TaskStatus.RUNNING.value, progress_total=len(token_ids))
         self.repos.save_wallet_task(
             wallet_task_id, job_id, request.wallet_address, TaskStatus.RUNNING.value, token_total=len(token_ids), current_stage="tokens"
         )
-        logger.info("获取周期 Token：%s workers=%s", len(token_ids), self.token_workers)
+        workers = 1 if cookie_mode else self.token_workers
+        logger.info("获取周期 Token：%s workers=%s cookie_mode=%s", len(token_ids), workers, cookie_mode)
 
         token_results: list[TokenAnalysisResult] = []
         all_trades: list[TradeRecord] = []
@@ -219,8 +256,8 @@ class WalletAnalysisService:
         failed = 0
         done = 0
         result_map: dict[str, tuple[TokenAnalysisResult, list[TradeRecord]]] = {}
-        max_pending = min(16, max(self.token_workers * 2, 4))
-        with ThreadPoolExecutor(max_workers=self.token_workers, thread_name_prefix="gmgn-token") as pool:
+        max_pending = min(16, max(workers * 2, 4))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="gmgn-token") as pool:
             pending: set = set()
             fut_token: dict = {}
             iterator = iter(token_ids)
@@ -463,19 +500,29 @@ class WalletAnalysisService:
             meta_early = (metadata_map or {}).get(token_address)
             symbol = (getattr(meta_early, "symbol", "") if meta_early else "") or token_address[:6]
         self._progress("first_buy", f"正在追溯 {symbol} 首次买入", 0, 0, request.wallet_address, token_address)
-        use_index = bool(swap_index and swap_index.by_token.get(token_address) and not self.deep_gmgn_history)
+        use_index = bool(swap_index is not None and not self.deep_gmgn_history)
         history: list[TradeRecord]
         pages = 0
         complete = True
         moralis_buy = None
         if use_index and self.orchestrator is not None:
-            bucket = swap_index.by_token[token_address]
-            history = [swap_to_trade(s, request.chain) for s in bucket.buys + bucket.sells + bucket.transfers_in + bucket.transfers_out]
+            bucket = swap_index.by_token.get(token_address)
+            if bucket is None or bucket.earliest_buy is None:
+                try:
+                    self.orchestrator.recover_token_history(request.wallet_address, token_address, swap_index)
+                except Exception as exc:
+                    logger.warning("token history recover 失败 %s: %s", token_address[:8], exc)
+                bucket = swap_index.by_token.get(token_address)
+            history = []
+            if bucket:
+                history = [swap_to_trade(s, request.chain) for s in bucket.buys + bucket.sells + bucket.transfers_in + bucket.transfers_out]
             try:
-                moralis_buy = bucket.earliest_buy or self.orchestrator.earliest_buy(request.wallet_address, token_address, swap_index)
+                moralis_buy = (bucket.earliest_buy if bucket else None) or self.orchestrator.earliest_buy(
+                    request.wallet_address, token_address, swap_index
+                )
             except Exception as exc:
                 logger.warning("earliest buy 失败 %s: %s", token_address[:8], exc)
-                moralis_buy = bucket.earliest_buy
+                moralis_buy = bucket.earliest_buy if bucket else None
             if moralis_buy:
                 extra = swap_to_trade(moralis_buy, request.chain)
                 if extra.activity_fingerprint not in {t.activity_fingerprint for t in history}:
@@ -568,18 +615,17 @@ class WalletAnalysisService:
         platforms = resolve_platforms(token_info, pool_info, activity_platform, autofill=request.options.autofill_missing)
         platform = platforms.display
         fifo = apply_fifo(history)
-        report_token_trades = [t for t in history if request.start_time <= t.timestamp <= request.end_time] if request.period != ReportPeriod.ALL else history
         if request.period == ReportPeriod.ALL:
             report_token_trades = history
         else:
             report_token_trades = [t for t in history if (not request.start_time or t.timestamp >= request.start_time) and (not request.end_time or t.timestamp <= request.end_time)]
 
-        buys = [t for t in report_token_trades if t.event_type == EventType.BUY]
-        sells = [t for t in report_token_trades if t.event_type == EventType.SELL]
-        buy_total = _sum_optional([t.cost_usd for t in buys]) if buys else Decimal("0")
-        sell_total = _sum_optional([t.cost_usd for t in sells]) if sells else Decimal("0")
-        buy_total_estimated = bool(buys) and any(getattr(t, "cost_usd_estimated", False) for t in buys)
-        sell_total_estimated = bool(sells) and any(getattr(t, "cost_usd_estimated", False) for t in sells)
+        all_buys = [t for t in history if t.event_type == EventType.BUY]
+        all_sells = [t for t in history if t.event_type == EventType.SELL]
+        buy_total = _sum_optional([t.cost_usd for t in all_buys]) if all_buys else Decimal("0")
+        sell_total = _sum_optional([t.cost_usd for t in all_sells]) if all_sells else Decimal("0")
+        buy_total_estimated = bool(all_buys) and any(getattr(t, "cost_usd_estimated", False) for t in all_buys)
+        sell_total_estimated = bool(all_sells) and any(getattr(t, "cost_usd_estimated", False) for t in all_sells)
         cost_est_any = any(getattr(t, "cost_usd_estimated", False) for t in history if t.cost_usd is not None)
 
         created = (
@@ -786,9 +832,9 @@ class WalletAnalysisService:
             open_at=open_at,
             pool_created_at=pool_created,
             time_diff_seconds=missing("local", "未计算"),
-            buy_count=len(buys),
+            buy_count=len(all_buys),
             buy_total_usd=buy_total,
-            sell_count=len(sells),
+            sell_count=len(all_sells),
             sell_total_usd=sell_total,
             buy_total_estimated=buy_total_estimated,
             sell_total_estimated=sell_total_estimated,

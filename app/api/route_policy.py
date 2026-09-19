@@ -9,6 +9,7 @@ ROUTE_POLICIES = {
     "token_info": 1,
     "token_pool_info": 1,
     "user_info": 2,
+    "wallet_holdings": 5,
 }
 
 

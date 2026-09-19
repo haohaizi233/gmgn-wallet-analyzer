@@ -44,8 +44,8 @@ def collect_rpc_fallback(
     *,
     start_ts: int = 0,
     end_ts: int = 0,
-    max_signatures: int = 400,
-    max_tx_verify: int = 250,
+    max_signatures: int = 800,
+    max_tx_verify: int = 400,
 ) -> WalletHistoryIndex:
     """Two-phase: wallet signatures in report window, then limited ATA first-activity."""
     sigs = _collect_wallet_signatures(rpc, wallet, start_ts=start_ts, end_ts=end_ts, limit=max_signatures)
@@ -63,14 +63,17 @@ def collect_rpc_fallback(
             txs.append(parsed)
     accounts = rpc.get_token_accounts_by_owner(wallet, None)
     atas = []
-    for acc in accounts[:80]:
+    for acc in accounts[:120]:
         pubkey = acc.get("pubkey") if isinstance(acc, dict) else None
         if pubkey:
             atas.append(str(pubkey))
     extra_sigs = []
-    for ata in atas[:20]:
-        extra_sigs.extend(rpc.get_signatures_for_address(ata, limit=20))
-    for item in extra_sigs[:max_tx_verify]:
+    for ata in atas[:60]:
+        extra_sigs.extend(rpc.get_signatures_for_address(ata, limit=30))
+        if len(extra_sigs) >= 600:
+            break
+    extra_budget = max(80, max_tx_verify)
+    for item in extra_sigs[:extra_budget]:
         signature = str(item.get("signature") or "")
         if not signature or signature in seen:
             continue
@@ -80,6 +83,65 @@ def collect_rpc_fallback(
         if parsed:
             txs.append(parsed)
     return build_index(wallet, txs, source="solana_rpc", pages=pages, bottom_complete=False)
+
+
+def recover_mint_history(
+    rpc: SolanaRpcProvider,
+    wallet: str,
+    mint: str,
+    *,
+    max_sigs: int = 400,
+    max_tx_verify: int = 60,
+) -> list:
+    """Pull ATA signatures for one mint and decode oldest+newest txs (first-buy recovery)."""
+    if not mint:
+        return []
+    accounts = rpc.get_token_accounts_by_owner(wallet, mint)
+    atas: list[str] = []
+    for acc in accounts:
+        pubkey = acc.get("pubkey") if isinstance(acc, dict) else None
+        if pubkey:
+            atas.append(str(pubkey))
+    if not atas:
+        return []
+    sigs: list[dict] = []
+    seen: set[str] = set()
+    for ata in atas[:4]:
+        before = None
+        while len(sigs) < max_sigs:
+            batch = rpc.get_signatures_for_address(ata, limit=min(100, max_sigs - len(sigs)), before=before)
+            if not batch:
+                break
+            for item in batch:
+                signature = str(item.get("signature") or "")
+                if not signature or signature in seen:
+                    continue
+                seen.add(signature)
+                sigs.append(item)
+            if len(batch) < 100:
+                break
+            before = batch[-1].get("signature")
+    if not sigs:
+        return []
+    newest_n = min(20, max_tx_verify // 3)
+    oldest_n = max_tx_verify - newest_n
+    if len(sigs) <= max_tx_verify:
+        selected = sigs
+    else:
+        selected = list(sigs[:newest_n]) + list(sigs[-oldest_n:])
+    txs = []
+    verified = set()
+    for item in selected:
+        signature = str(item.get("signature") or "")
+        if not signature or signature in verified:
+            continue
+        verified.add(signature)
+        raw = rpc.get_transaction(signature)
+        parsed = _tx_from_rpc(raw, wallet, signature, item.get("blockTime"))
+        if parsed:
+            txs.append(parsed)
+    logger.info("mint ATA recover wallet=%s mint=%s atas=%s sigs=%s txs=%s", wallet[:8], mint[:8], len(atas), len(sigs), len(txs))
+    return txs
 
 
 def _collect_wallet_signatures(rpc: SolanaRpcProvider, wallet: str, start_ts: int, end_ts: int, limit: int) -> list[dict]:

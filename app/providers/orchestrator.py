@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable, Optional
 
 from app.api.gmgn_client import GMGNClient
@@ -12,7 +13,7 @@ from app.providers.defillama.client import DefiLlamaProvider
 from app.providers.geckoterminal.client import GeckoTerminalProvider
 from app.providers.gmgn.adapter import GMGNVerifierProvider
 from app.providers.helius.client import HeliusProvider, OFFICIAL_RPC
-from app.providers.helius.history import collect_rpc_fallback
+from app.providers.helius.history import collect_rpc_fallback, recover_mint_history
 from app.providers.helius.parsers import history_to_swaps
 from app.providers.jupiter.client import JupiterProvider
 from app.providers.raydium.client import RaydiumProvider
@@ -24,6 +25,15 @@ from app.providers.pumpfun.client import PumpFunProvider
 from app.providers.result import HistoryCoverage, coverage_from_swaps
 from app.providers.solana.rpc_client import SolanaRpcProvider
 from app.providers.solana.transaction_parser import parse_verified_transaction
+from app.providers.token_universe import (
+    HOLDINGS_MAX_PAGES,
+    MAX_UNIVERSE_TOKENS,
+    extract_mints_from_gmgn_holdings,
+    extract_mints_from_helius_balances,
+    is_quote_mint,
+    merge_token_universe,
+    trade_to_swap,
+)
 from app.storage.database import Database
 from app.storage.repositories import Repositories
 from app.utils.logger import get_logger
@@ -71,6 +81,7 @@ class DataOrchestrator:
         self.last_swap_index: WalletSwapIndex | None = None
         self._sol_usd = None
         self._sol_usd_loaded = False
+        self._index_lock = threading.Lock()
 
     @classmethod
     def from_config(cls, config, gmgn_client: GMGNClient | None, db: Database | None, cancel_event=None, on_health=None) -> "DataOrchestrator":
@@ -121,7 +132,7 @@ class DataOrchestrator:
         providers.append(DefiLlamaProvider(cache=cache))
         providers.append(RaydiumProvider(cache=cache))
         providers.append(PumpFunProvider(cache=cache))
-        enable_gmgn = bool(getattr(config, "enable_gmgn", True))
+        enable_gmgn = bool(getattr(config, "enable_gmgn", True)) or bool(getattr(gmgn_client, "cookie_mode", False))
         deep = bool(getattr(config, "enable_gmgn_deep_history_fallback", False))
         gmgn = GMGNVerifierProvider(gmgn_client if enable_gmgn else None, deep_history=deep)
         if not enable_gmgn:
@@ -531,6 +542,118 @@ class DataOrchestrator:
         self.last_swap_index = index
         self.last_coverage = index.coverage
         return index
+
+    def expand_token_universe(self, wallet: str, chain: str = "sol") -> list[str]:
+        groups: list[list[str]] = []
+        rpc = self.providers.get("solana_rpc")
+        if isinstance(rpc, SolanaRpcProvider):
+            try:
+                mints = rpc.list_owner_mints(wallet, include_zero=True)
+                groups.append(mints)
+                logger.info("token universe spl_accounts=%s wallet=%s", len(mints), wallet[:8])
+            except Exception as exc:
+                logger.warning("SPL token accounts 枚举失败: %s", exc)
+        helius = self.providers.get("helius")
+        if isinstance(helius, HeliusProvider) and helius.enabled:
+            try:
+                helius.ensure_probed(self.repos)
+            except Exception:
+                pass
+            if helius.cap_flags.get("WALLET_BALANCES"):
+                try:
+                    payload = helius.get_wallet_balances(wallet)
+                    mints = extract_mints_from_helius_balances(payload)
+                    groups.append(mints)
+                    logger.info("token universe helius_balances=%s wallet=%s", len(mints), wallet[:8])
+                except Exception as exc:
+                    logger.warning("Helius balances 枚举失败: %s", exc)
+        gmgn = self.gmgn()
+        if gmgn and gmgn.enabled:
+            try:
+                mints = self._gmgn_holding_mints(chain, wallet)
+                groups.append(mints)
+                if mints:
+                    logger.info("token universe gmgn_holdings=%s wallet=%s", len(mints), wallet[:8])
+            except Exception as exc:
+                logger.info("GMGN holdings 跳过（官方名单补全失败不影响主流程）: %s", exc)
+        merged = merge_token_universe(*groups, limit=MAX_UNIVERSE_TOKENS)
+        logger.info("token universe merged=%s wallet=%s", len(merged), wallet[:8])
+        return merged
+
+    def recover_token_history(self, wallet: str, mint: str, index: WalletSwapIndex | None = None) -> list[WalletSwap]:
+        if not mint or is_quote_mint(mint):
+            return []
+        with self._index_lock:
+            if index and mint in index.by_token and index.by_token[mint].earliest_buy:
+                return []
+        extra: list[WalletSwap] = []
+        rpc = self.providers.get("solana_rpc")
+        if isinstance(rpc, SolanaRpcProvider):
+            try:
+                txs = recover_mint_history(rpc, wallet, mint)
+                extra.extend(history_to_swaps(wallet, txs, sol_usd=self.sol_usd_price()))
+            except Exception as exc:
+                logger.warning("ATA first-buy recover 失败 %s: %s", mint[:8], exc)
+        has_buy = any((s.transaction_type or "").lower() == "buy" for s in extra)
+        if not has_buy:
+            extra.extend(self._gmgn_token_activity_swaps(wallet, mint))
+        if not extra:
+            return []
+        if index is not None:
+            with self._index_lock:
+                index.swaps = merge_swaps(extra, index.swaps)
+                index.by_token = _index_swaps(index.wallet, index.swaps)
+        logger.info(
+            "token recover mint=%s extra_swaps=%s buys=%s",
+            mint[:8],
+            len(extra),
+            sum(1 for s in extra if (s.transaction_type or "").lower() == "buy"),
+        )
+        return extra
+
+    def _gmgn_holding_mints(self, chain: str, wallet: str) -> list[str]:
+        gmgn = self.gmgn()
+        if not gmgn or not gmgn.enabled or not gmgn.client or not hasattr(gmgn.client, "get_wallet_holdings"):
+            return []
+        found: list[str] = []
+        cursor = None
+        for _ in range(HOLDINGS_MAX_PAGES):
+            payload = gmgn.get_wallet_holdings(
+                chain,
+                wallet,
+                cursor=cursor,
+                limit=50,
+                hide_airdrop=False,
+                hide_closed=False,
+                hide_abnormal=False,
+            )
+            page, nxt = extract_mints_from_gmgn_holdings(payload)
+            found.extend(page)
+            if not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return found
+
+    def _gmgn_token_activity_swaps(self, wallet: str, mint: str, *, chain: str = "sol", max_pages: int = 2) -> list[WalletSwap]:
+        gmgn = self.gmgn()
+        if not gmgn or not gmgn.enabled:
+            return []
+        from app.api.parsers import parse_activity_page
+
+        cursor = None
+        trades = []
+        try:
+            for _ in range(max_pages):
+                payload = gmgn.get_wallet_activity_for_token(chain, wallet, token_address=mint, cursor=cursor, limit=50)
+                page_trades, nxt = parse_activity_page(payload, wallet, chain)
+                trades.extend(page_trades)
+                if not nxt:
+                    break
+                cursor = nxt
+        except Exception as exc:
+            logger.info("GMGN token activity recover 跳过 %s: %s", mint[:8], exc)
+            return []
+        return [trade_to_swap(item) for item in trades if item.token_address == mint]
 
     def earliest_buy(self, wallet: str, token: str, index: WalletSwapIndex | None = None) -> Optional[WalletSwap]:
         if index and token in index.by_token and index.by_token[token].earliest_buy:

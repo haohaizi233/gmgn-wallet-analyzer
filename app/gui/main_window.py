@@ -21,7 +21,7 @@ from app.gui.ui_scheduler import DRAIN_BUDGET, coalesce_messages
 from app.storage.database import Database
 from app.storage.repositories import Repositories
 from app.utils.logger import attach_queue_handler, get_logger, setup_logging
-from app.utils.paths import ensure_runtime_dirs
+from app.utils.paths import ENV_PATH, INPUT_DIR, OUTPUT_DIR, ensure_runtime_dirs
 from app.version import APP_NAME, __version__
 
 logger = get_logger("gmgn.gui")
@@ -115,7 +115,19 @@ class MainWindow(ctk.CTk):
         else:
             self.log_panel.append("Helius: NOT CONFIGURED (Optional)")
         if not self.config.has_api_key:
-            self.log_panel.append("GMGN 未配置，仅作可选辅助。")
+            self.log_panel.append("GMGN OpenAPI 未配置。默认采集方式是网页自动化（Cookie 号池）。")
+        try:
+            from app.browser.cookie_pool import CookiePool
+
+            pool = CookiePool()
+            usable = len(pool.usable())
+            total = len(pool.all())
+            self.log_panel.append(f"GMGN Cookie 号池：{usable}/{total} 可用。")
+        except Exception as exc:
+            self.log_panel.append(f"GMGN Cookie 号池读取失败：{exc}", "WARNING")
+        self.log_panel.append(f"配置文件：{ENV_PATH}")
+        self.log_panel.append(f"输入目录：{INPUT_DIR}（默认 地址.txt）")
+        self.log_panel.append(f"输出目录：{OUTPUT_DIR}")
         self.log_panel.append("配置已加载，可以开始分析。")
 
     def show_page(self, key: str) -> None:

@@ -104,6 +104,11 @@ class SolanaRpcProvider(HttpProviderMixin, DataProvider):
                 rows = list(rows) + extra_val
         return rows
 
+    def list_owner_mints(self, owner: str, *, include_zero: bool = True) -> list[str]:
+        from app.providers.token_universe import extract_mints_from_token_accounts
+
+        return extract_mints_from_token_accounts(self.get_token_accounts_by_owner(owner, None), include_zero=include_zero)
+
     def get_token_balance(self, owner: str, mint: str) -> Optional[Decimal]:
         accounts = self.get_token_accounts_by_owner(owner, mint)
         total = Decimal("0")

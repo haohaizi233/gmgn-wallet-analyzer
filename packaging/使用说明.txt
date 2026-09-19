@@ -1,0 +1,16 @@
+# GMGN 钱包分析 · 独立运行说明
+
+把整个「GMGNWallet」文件夹一起拷贝，双击 GMGNWallet.exe。不需要安装 Python。
+
+目录（都在 exe 旁边，不要塞进 _internal）：
+
+  .env              现有配置，含 API Key。改这里即可，不必重新打包。
+  input/地址.txt    钱包地址，一行一个。程序启动会自动读入。
+  output/           导出的 Excel
+  logs/             运行日志
+  data/             本地数据库和原始 JSON
+
+不要只拷贝 exe。_internal 是运行库，必须和 exe 放在同一层。
+
+首次启动如果旁边没有 .env，会从打包时的默认配置写出一份。
+已有 .env 时不会覆盖。

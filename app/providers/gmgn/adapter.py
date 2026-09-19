@@ -26,6 +26,7 @@ class GMGNVerifierProvider(DataProvider):
         ProviderCapability.LAUNCHPAD,
         ProviderCapability.HISTORICAL_PRICE,
         ProviderCapability.TOKEN_CREATION,
+        ProviderCapability.WALLET_HOLDINGS,
     }
 
     def __init__(self, client: Optional[GMGNClient] = None, deep_history: bool = False):
@@ -95,3 +96,14 @@ class GMGNVerifierProvider(DataProvider):
         if not self.deep_history:
             logger.info("跳过 GMGN 深历史（ENABLE_GMGN_DEEP_HISTORY_FALLBACK=false）")
         return self._wrap(self.client.get_wallet_activity, *args, **kwargs)
+
+    def get_wallet_activity_for_token(self, *args, **kwargs) -> dict[str, Any]:
+        """Token-scoped activity for first-buy recovery. Not a full-wallet deep crawl."""
+        if not self.client:
+            raise ProviderRateLimitError("GMGN 未配置", provider=self.name)
+        return self._wrap(self.client.get_wallet_activity, *args, **kwargs)
+
+    def get_wallet_holdings(self, *args, **kwargs) -> dict[str, Any]:
+        if not self.client:
+            raise ProviderRateLimitError("GMGN 未配置", provider=self.name)
+        return self._wrap(self.client.get_wallet_holdings, *args, **kwargs)

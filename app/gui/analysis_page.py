@@ -18,11 +18,9 @@ from app.gui.components.stat_card import StatCard
 from app.gui.theme import BG, DANGER, MUTED, PANEL, PRIMARY, TEXT, font
 from app.gui.worker import AnalysisWorker
 from app.services.completeness_service import CompletenessService
+from app.utils.paths import INPUT_DIR, OUTPUT_DIR, default_wallet_file, open_in_explorer, read_wallet_file, write_wallet_file
 from app.utils.time_utils import LOCAL_TZ, format_elapsed, period_window
 from app.utils.validators import parse_wallet_lines, short_address, summarize_wallet_input
-
-
-EXAMPLE_WALLET = "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV"
 
 TOKEN_COLUMNS = [
     ("idx", "#", 40),
@@ -109,8 +107,14 @@ class AnalysisPage(ctk.CTkFrame):
         btns = ctk.CTkFrame(form, fg_color="transparent")
         btns.pack(fill="x", padx=16, pady=6)
         ctk.CTkButton(btns, text="从文件导入", width=90, height=28, command=self._import_file).pack(side="left")
-        ctk.CTkButton(btns, text="粘贴示例", width=80, height=28, fg_color="#E5E7EB", text_color=TEXT, command=self._paste_example).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="重新加载", width=80, height=28, fg_color="#E5E7EB", text_color=TEXT, command=self._reload_wallets).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="保存", width=60, height=28, fg_color="#E5E7EB", text_color=TEXT, command=self._save_wallets).pack(side="left", padx=6)
         ctk.CTkButton(btns, text="清空", width=60, height=28, fg_color="#E5E7EB", text_color=TEXT, command=lambda: self.wallet_text.delete("1.0", "end")).pack(side="left")
+        dirs = ctk.CTkFrame(form, fg_color="transparent")
+        dirs.pack(fill="x", padx=16)
+        ctk.CTkButton(dirs, text="打开输入目录", width=100, height=28, fg_color="#E5E7EB", text_color=TEXT, command=lambda: open_in_explorer(INPUT_DIR)).pack(side="left")
+        ctk.CTkButton(dirs, text="打开输出目录", width=100, height=28, fg_color="#E5E7EB", text_color=TEXT, command=lambda: open_in_explorer(OUTPUT_DIR)).pack(side="left", padx=6)
+        self._reload_wallets(silent=True)
 
         ctk.CTkLabel(form, text="时间范围", font=font(14, "bold"), text_color=TEXT, anchor="w").pack(fill="x", padx=16, pady=(10, 6))
         period_bar = ctk.CTkFrame(form, fg_color="transparent")
@@ -136,8 +140,11 @@ class AnalysisPage(ctk.CTkFrame):
         self.opt_fill = ctk.BooleanVar(value=True)
         self.opt_raw = ctk.BooleanVar(value=True)
         self.opt_pump = ctk.BooleanVar(value=False)
+        mode_default = str(getattr(app.config, "collection_mode", "automation") or "automation")
+        self.opt_collect = ctk.StringVar(value="自动化" if mode_default != "api" else "API")
+        self.opt_headed = ctk.BooleanVar(value=bool(getattr(app.config, "browser_headed", True)))
         self.max_tx_var = ctk.StringVar(value="2500")
-        self.adv_drawer = OptionDrawer(form, title="高级选项", summary="5 项开启 · 上限 2500")
+        self.adv_drawer = OptionDrawer(form, title="高级选项", summary="自动化 · 有头 · 5 项开启 · 上限 2500")
         self.adv_drawer.trigger.configure(command=self._toggle_advanced)
         self.adv_drawer.trigger.pack(fill="x", padx=16, pady=(10, 0))
         self._adv_built = False
@@ -148,9 +155,12 @@ class AnalysisPage(ctk.CTkFrame):
             self.opt_fill,
             self.opt_raw,
             self.opt_pump,
+            self.opt_headed,
         ):
             var.trace_add("write", lambda *_a: self._refresh_adv_summary())
         self.max_tx_var.trace_add("write", lambda *_a: self._refresh_adv_summary())
+        self.opt_collect.trace_add("write", lambda *_a: self._refresh_adv_summary())
+        self._refresh_adv_summary()
 
         start_bar = ctk.CTkFrame(form, fg_color="transparent")
         start_bar.pack(fill="x", padx=16, pady=12)
@@ -345,6 +355,17 @@ class AnalysisPage(ctk.CTkFrame):
     def _build_advanced_drawer(self) -> None:
         body = self.adv_drawer.body
         assert body is not None
+        ctk.CTkLabel(body, text="采集方式", font=font(12), text_color=MUTED).pack(anchor="w")
+        ctk.CTkSegmentedButton(body, values=["自动化", "API"], variable=self.opt_collect, width=220).pack(anchor="w", pady=(0, 6))
+        ctk.CTkLabel(
+            body,
+            text="自动化走 gmgn.ai Cookie 号池（失效自动扫码）。API 走 OpenAPI Key。",
+            font=font(11),
+            text_color=MUTED,
+            wraplength=260,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        ctk.CTkCheckBox(body, text="浏览器有头模式（扫码时强制有头）", variable=self.opt_headed, font=font(12)).pack(anchor="w", pady=(0, 8))
         row = ctk.CTkFrame(body, fg_color="transparent")
         row.pack(fill="x", pady=(0, 6))
         ctk.CTkLabel(row, text="每钱包交易上限", font=font(12), text_color=MUTED).pack(side="left")
@@ -375,7 +396,23 @@ class AnalysisPage(ctk.CTkFrame):
             if var.get()
         )
         limit = (self.max_tx_var.get() or "2500").strip() or "2500"
-        self.adv_drawer.set_summary(f"{enabled} 项开启 · 上限 {limit}")
+        collect = self.opt_collect.get() or "自动化"
+        headed = "有头" if self.opt_headed.get() else "无头"
+        self.adv_drawer.set_summary(f"{collect} · {headed} · {enabled} 项开启 · 上限 {limit}")
+
+    def _persist_collection_settings(self, mode: str, headed: bool) -> None:
+        try:
+            from dotenv import set_key
+
+            from app.utils.paths import ENV_PATH, ensure_runtime_dirs
+
+            ensure_runtime_dirs()
+            set_key(str(ENV_PATH), "GMGN_COLLECTION_MODE", mode, quote_mode="never")
+            set_key(str(ENV_PATH), "GMGN_BROWSER_HEADED", "true" if headed else "false", quote_mode="never")
+            self.app.config.collection_mode = mode
+            self.app.config.browser_headed = headed
+        except Exception:
+            pass
 
     def _refresh_keys(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -432,17 +469,33 @@ class AnalysisPage(ctk.CTkFrame):
         self.start_var.set(start.strftime("%Y-%m-%d"))
         self.end_var.set(now.strftime("%Y-%m-%d"))
 
+    def _set_wallet_text(self, text: str) -> None:
+        self.wallet_text.delete("1.0", "end")
+        if text:
+            self.wallet_text.insert("1.0", text.rstrip() + "\n")
+        self._refresh_wallet_stats()
+
+    def _reload_wallets(self, silent: bool = False) -> None:
+        text = read_wallet_file()
+        self._set_wallet_text(text)
+        if silent:
+            return
+        path = default_wallet_file()
+        if path.exists():
+            messagebox.showinfo("已加载", str(path))
+        else:
+            messagebox.showwarning("未找到地址文件", f"请把钱包地址放到：\n{path}")
+
+    def _save_wallets(self) -> None:
+        path = write_wallet_file(self.wallet_text.get("1.0", "end"))
+        messagebox.showinfo("已保存", str(path))
+
     def _import_file(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Text", "*.txt"), ("All", "*.*")])
+        path = filedialog.askopenfilename(initialdir=str(INPUT_DIR), filetypes=[("Text", "*.txt"), ("All", "*.*")])
         if not path:
             return
         text = open(path, encoding="utf-8").read()
-        self.wallet_text.delete("1.0", "end")
-        self.wallet_text.insert("1.0", text)
-
-    def _paste_example(self) -> None:
-        self.wallet_text.delete("1.0", "end")
-        self.wallet_text.insert("1.0", EXAMPLE_WALLET)
+        self._set_wallet_text(text)
 
     def start_analysis(self) -> None:
         self.adv_drawer.close()
@@ -457,7 +510,10 @@ class AnalysisPage(ctk.CTkFrame):
             messagebox.showerror("无法开始", "请输入有效 Solana 钱包地址")
             return
         moralis_ready = bool(getattr(self.app.config, "enable_moralis", False) and getattr(self.app.config, "moralis_api_key", ""))
-        if not moralis_ready and not getattr(self.app.config, "helius_api_key", "") and not self.app.config.has_api_key:
+        collect_mode = "automation" if (self.opt_collect.get() or "自动化") != "API" else "api"
+        if collect_mode == "automation":
+            self.app.log_panel.append("采集方式：GMGN 网页自动化。Cookie 失效时会弹出有头窗口扫码。")
+        elif not moralis_ready and not getattr(self.app.config, "helius_api_key", "") and not self.app.config.has_api_key:
             self.app.log_panel.append("未配置 Moralis / Helius / GMGN。将使用 Solana 公共 RPC + DEX Screener。", "WARNING")
         if not getattr(self.app.config, "helius_api_key", ""):
             self.app.log_panel.append("Helius: NOT CONFIGURED (Optional)", "INFO")
@@ -475,7 +531,10 @@ class AnalysisPage(ctk.CTkFrame):
             autofill_missing=self.opt_fill.get(),
             save_raw_json=self.opt_raw.get(),
             pumpfun_only=self.opt_pump.get(),
+            collection_mode=collect_mode,
+            browser_headed=bool(self.opt_headed.get()),
         )
+        self._persist_collection_settings(collect_mode, bool(self.opt_headed.get()))
         max_tx = int(self.max_tx_var.get() or 2500)
         requests = [
             WalletAnalysisRequest(

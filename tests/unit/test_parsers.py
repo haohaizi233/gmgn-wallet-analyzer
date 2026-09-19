@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from app.api.parsers import parse_activity_page, parse_event_type, parse_token_info
@@ -60,6 +61,69 @@ class CollectorCursorTests(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual({t.tx_hash for t in trades}, {"t1", "t0"})
         self.assertEqual(min(t.timestamp for t in trades if t.event_type.value == "buy"), 100)
+
+
+class MarketCapParserTests(unittest.TestCase):
+    def test_activity_item_reads_market_cap_directly(self):
+        from app.api.parsers import parse_activity_item
+
+        item = {
+            "event_type": "buy",
+            "tx_hash": "tx1",
+            "timestamp": 1757800000,
+            "token_amount": "83.89",
+            "price_usd": "0.0049",
+            "cost_usd": "300.46",
+            "market_cap": "411950",
+            "token": {"address": "MintAAA", "symbol": "AAA", "name": "Alpha", "total_supply": "84000000"},
+        }
+        trade = parse_activity_item(item, "Wallet1", "sol")
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertEqual(trade.market_cap, Decimal("411950"))
+
+    def test_activity_item_falls_back_to_token_market_cap(self):
+        from app.api.parsers import parse_activity_item
+
+        item = {
+            "event_type": "buy",
+            "tx_hash": "tx2",
+            "timestamp": 1757800000,
+            "token_amount": "10",
+            "price_usd": "0.01",
+            "cost_usd": "0.1",
+            "token": {"address": "MintBBB", "symbol": "BBB", "market_cap": "999000"},
+        }
+        trade = parse_activity_item(item, "Wallet1", "sol")
+        assert trade is not None
+        self.assertEqual(trade.market_cap, Decimal("999000"))
+
+    def test_acquisition_prefers_trade_market_cap(self):
+        from app.domain.enums import AcquisitionType
+        from app.services.acquisition_resolver import resolve_acquisition
+
+        class FakeTrade:
+            event_type = None
+            timestamp = 0
+            tx_hash = "tx1"
+            token_amount = Decimal("83.89")
+            price_usd = Decimal("0.0049")
+            cost_usd = Decimal("300.46")
+            cost_sol = None
+            gas_usd = Decimal("1.174")
+            gas_sol = None
+            total_supply_at_trade = Decimal("84000000")
+            market_cap = Decimal("411950")
+            cost_sol_estimated = False
+
+        buy = FakeTrade()
+        buy.event_type = EventType.BUY
+        buy.timestamp = 1757800000
+        acq = resolve_acquisition([buy], token_info=None, detect_special=False)
+        self.assertEqual(acq.acquisition_type, AcquisitionType.BUY)
+        self.assertEqual(acq.market_cap, Decimal("411950"))
+        self.assertFalse(acq.market_cap_is_estimated)
+        self.assertEqual(acq.market_cap_source, "wallet_activity.market_cap")
 
 
 if __name__ == "__main__":

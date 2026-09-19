@@ -9,12 +9,13 @@ from typing import Optional
 
 from app.api.credential_pool import CredentialPool
 from app.api.exceptions import AnalysisCancelledError, GMGNAuthError, GMGNRateLimitError
+from app.browser.exceptions import BrowserNetworkError, BrowserSessionError
 from app.api.gmgn_client import GMGNClient
 from app.api.rate_limiter import WeightedRateLimiter
 from app.api.request_executor import ApiRequestExecutor
 from app.api.scheduler import CredentialScheduler, GlobalSafetyController
 from app.config import AppConfig
-from app.domain.enums import TaskStatus
+from app.domain.enums import CollectionMode, TaskStatus
 from app.domain.models import WalletAnalysisRequest, WalletReport
 from app.jobs.event_bus import AnalysisEventBus
 from app.jobs.models import AnalysisJob, JobState, WalletTask
@@ -121,7 +122,47 @@ class AnalysisJobEngine:
         }
         self.bus.emit(event)
 
-    def _make_client(self, job: AnalysisJob, cancel_event: threading.Event) -> GMGNClient:
+    def _collection_mode(self, job: AnalysisJob) -> str:
+        options = job.requests[0].options if job.requests else None
+        raw = str(getattr(options, "collection_mode", "") or "").strip().lower()
+        if raw in {CollectionMode.AUTOMATION.value, CollectionMode.API.value}:
+            return raw
+        cfg = str(getattr(self.config, "collection_mode", "") or "").strip().lower()
+        if cfg in {CollectionMode.AUTOMATION.value, CollectionMode.API.value}:
+            return cfg
+        return CollectionMode.API.value
+
+    def _make_client(self, job: AnalysisJob, cancel_event: threading.Event):
+        if self._collection_mode(job) == CollectionMode.AUTOMATION.value:
+            from app.browser.cookie_pool import CookiePool
+            from app.browser.web_client import GmgnWebClient
+
+            first = job.requests[0] if job.requests else None
+            headed = True if first is None else bool(getattr(first.options, "browser_headed", True))
+            timeout = float(getattr(self.config, "gmgn_qr_login_timeout", 180) or 180)
+
+            def on_event(message: str) -> None:
+                self._emit(
+                    job,
+                    {
+                        "type": "progress",
+                        "message": message,
+                        "stage": "browser",
+                        "wallet": first.wallet_address if first else "",
+                    },
+                )
+
+            return GmgnWebClient(
+                CookiePool(),
+                headed=headed,
+                qr_timeout=timeout,
+                limiter=self.limiter,
+                cancel_event=cancel_event,
+                on_event=on_event,
+                start_ts=int(first.start_time) if first else 0,
+                end_ts=int(first.end_time) if first else 0,
+            )
+
         def on_wait(payload: dict) -> None:
             job.state = JobState.WAITING_API
             resume = payload.get("resume_at") or 0
@@ -155,8 +196,9 @@ class AnalysisJobEngine:
         job.state = JobState.RUNNING
         self._emit(job, {"type": "JOB_STARTED", "wallets": job.wallets, "wallet_count": len(job.wallets)})
         client = self._make_client(job, cancel_event)
-        scheduler = client.scheduler
+        scheduler = getattr(client, "scheduler", None)
         self.scheduler = scheduler
+        automation = self._collection_mode(job) == CollectionMode.AUTOMATION.value
 
         def on_health(rows) -> None:
             text = "  |  ".join(
@@ -180,6 +222,11 @@ class AnalysisJobEngine:
             deep_gmgn_history=bool(getattr(self.config, "enable_gmgn_deep_history_fallback", False)),
         )
         try:
+            if automation:
+                logger.info("采集方式=自动化，立刻启动浏览器（不先跑 Helius）")
+                warmup = getattr(client, "warmup", None)
+                if warmup:
+                    warmup()
             for request in job.requests:
                 self.repos.save_wallet_task(
                     request.wallet_task_id,
@@ -187,7 +234,7 @@ class AnalysisJobEngine:
                     request.wallet_address,
                     JobState.QUEUED.value,
                 )
-            if len(job.requests) <= 1:
+            if automation or len(job.requests) <= 1:
                 for request in job.requests:
                     self._analyze_wallet(job, service, scheduler, request, cancel_event)
             else:
@@ -222,11 +269,35 @@ class AnalysisJobEngine:
             job.state = JobState.FAILED
             job.error = str(exc)
             self._emit(job, {"type": "error", "message": str(exc), "reports": job.reports})
-        except Exception as exc:
-            logger.exception("Job 失败")
+        except BrowserNetworkError as exc:
             job.state = JobState.FAILED
             job.error = str(exc)
+            logger.error("%s", exc)
             self._emit(job, {"type": "error", "message": str(exc), "reports": job.reports})
+        except BrowserSessionError as exc:
+            job.state = JobState.FAILED
+            job.error = str(exc)
+            logger.error("%s", exc)
+            self._emit(job, {"type": "error", "message": str(exc), "reports": job.reports})
+        except Exception as exc:
+            if "has been closed" in str(exc).lower() or "TargetClosed" in type(exc).__name__:
+                msg = "浏览器窗口被关掉了，采集中断"
+                job.state = JobState.FAILED
+                job.error = msg
+                logger.error("%s", msg)
+                self._emit(job, {"type": "error", "message": msg, "reports": job.reports})
+            else:
+                logger.exception("Job 失败")
+                job.state = JobState.FAILED
+                job.error = str(exc)
+                self._emit(job, {"type": "error", "message": str(exc), "reports": job.reports})
+        finally:
+            closer = getattr(client, "close", None)
+            if closer:
+                try:
+                    closer()
+                except Exception:
+                    logger.debug("关闭采集客户端失败", exc_info=True)
 
     def _on_progress(self, job: AnalysisJob, payload: dict) -> None:
         wallet = payload.get("wallet") or ""
@@ -240,6 +311,10 @@ class AnalysisJobEngine:
         self._emit(job, {"type": "progress", **payload})
 
     def _guard_api(self, job: AnalysisJob, task: WalletTask, scheduler: CredentialScheduler, cancel_event: threading.Event, service: WalletAnalysisService | None = None) -> None:
+        if getattr(getattr(service, "client", None), "cookie_mode", False):
+            return
+        if scheduler is None:
+            return
         orch = getattr(service, "orchestrator", None) if service else None
         if orch is not None:
             helius = orch.provider("helius")
@@ -336,7 +411,23 @@ class AnalysisJobEngine:
             except GMGNAuthError:
                 task.state = JobState.FAILED
                 raise
+            except BrowserSessionError as exc:
+                task.state = JobState.FAILED
+                task.error = str(exc)
+                logger.error("钱包失败 %s: %s", request.wallet_address, exc)
+                self._emit(job, {"type": "WALLET_FINISHED", "wallet": request.wallet_address, "error": str(exc), "wallet_task_id": request.wallet_task_id})
+                if "关掉" in str(exc) or "采集中断" in str(exc):
+                    raise
+                return None
             except Exception as exc:
+                closed = "has been closed" in str(exc).lower() or "TargetClosed" in type(exc).__name__
+                if closed:
+                    wrapped = BrowserSessionError("浏览器窗口被关掉了，采集中断")
+                    task.state = JobState.FAILED
+                    task.error = str(wrapped)
+                    logger.error("钱包失败 %s: %s", request.wallet_address, wrapped)
+                    self._emit(job, {"type": "WALLET_FINISHED", "wallet": request.wallet_address, "error": str(wrapped), "wallet_task_id": request.wallet_task_id})
+                    raise wrapped from exc
                 task.state = JobState.FAILED
                 task.error = str(exc)
                 logger.exception("钱包失败 %s", request.wallet_address)

@@ -92,6 +92,10 @@ def parse_activity_item(item: dict[str, Any], wallet_address: str, chain: str) -
     name = str(first_present(token, "name") or item.get("name") or "").strip() or symbol
     launchpad_platform = first_present(item, "launchpad_platform") or first_present(token, "launchpad_platform", "launchpad")
     supply = to_decimal(first_present(token, "total_supply", "max_supply") or item.get("total_supply"))
+    market_cap = to_decimal(
+        first_present(item, "market_cap", "marketCap", "market_cap_usd")
+        or first_present(token, "market_cap", "marketCap", "market_cap_usd")
+    )
     buy_cost_usd = to_decimal(item.get("buy_cost_usd"))
 
     if not token_address:
@@ -117,6 +121,7 @@ def parse_activity_item(item: dict[str, Any], wallet_address: str, chain: str) -
         buy_cost_usd=buy_cost_usd,
         quote_symbol=str(quote_symbol) if quote_symbol else None,
         total_supply_at_trade=supply,
+        market_cap=market_cap,
         amount_status=_status_for(token_amount),
         cost_usd_status=_status_for(cost_usd),
         cost_sol_status=FieldStatus.ESTIMATED if cost_sol_estimated else _status_for(cost_sol),
