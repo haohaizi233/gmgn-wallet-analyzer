@@ -415,12 +415,28 @@ class BrowserSession:
         dismiss_announcement_modal(page, self.emit)
 
     def _qr_login(self) -> None:
-        from app.browser.scraper import click_login, dismiss_announcement_modal, is_logged_in, wait_until_logged_in
+        from app.browser.cookie_pool import has_login_cookies
+        from app.browser.scraper import (
+            click_login,
+            dismiss_announcement_modal,
+            announcement_modal_visible,
+            is_logged_in,
+            wait_until_logged_in,
+        )
 
         if self.page is None:
             raise BrowserSessionError("页面未就绪")
         dismiss_announcement_modal(self.page, self.emit)
-        if is_logged_in(self.page):
+        # Only trust "already logged in" when real gmgn.ai session cookies exist.
+        # A freshly opened page (no cookies) can show a transient false-positive
+        # header state (overlay/skeleton) — never skip the QR flow on that alone.
+        already = False
+        if is_logged_in(self.page) and not announcement_modal_visible(self.page):
+            try:
+                already = has_login_cookies(self.storage_state())
+            except Exception:
+                already = False
+        if already:
             self.persist_login()
             return
         click_login(self.page)

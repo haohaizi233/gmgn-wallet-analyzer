@@ -79,70 +79,16 @@ class ExportService:
                     "是否估算": "否",
                 }
             ]
-        scope_rows = [
-            {
-                "钱包": report.scope.wallet_address,
-                "链": report.scope.chain,
-                "报告周期": report.scope.period,
-                "开始时间": format_datetime(report.scope.start_time) if report.scope.start_time else "全部",
-                "结束时间": format_datetime(report.scope.end_time),
-                "实际最早交易": format_datetime(report.scope.earliest_trade_ts) if report.scope.earliest_trade_ts else "无交易",
-                "实际最晚交易": format_datetime(report.scope.latest_trade_ts) if report.scope.latest_trade_ts else "无交易",
-                "报告交易数": report.scope.report_trade_count,
-                "历史追溯交易数": report.scope.history_trade_count,
-                "API页数": report.scope.api_pages,
-                "Token数量": report.scope.token_count,
-                "是否被上限截断": "是" if report.scope.truncated_by_max else "否",
-                "生成时间": report.scope.generated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "版本": report.scope.version or __version__,
-                "Excel路径": str(xlsx),
-                "JSON路径": str(json_path),
-                "主历史数据源": report.scope.primary_history_provider or "无",
-                "Fallback数据源": report.scope.fallback_provider or "无",
-                "请求开始": format_datetime(report.scope.start_time) if report.scope.start_time else "全部",
-                "请求结束": format_datetime(report.scope.end_time) if report.scope.end_time else "全部",
-                "实际覆盖开始": report.scope.actual_coverage_start or "无",
-                "实际覆盖结束": report.scope.actual_coverage_end or "无",
-                "Coverage Complete": report.scope.coverage_complete or "否",
-                "Verified Empty": report.scope.verified_empty or "否",
-                "History Pages": report.scope.history_pages,
-                "History Transactions": report.scope.history_transactions,
-                "Fallback Used": report.scope.fallback_used or "否",
-            }
-        ]
-        raw_rows = [
-            {
-                "请求数": report.api_stats.requests,
-                "缓存命中": report.api_stats.cache_hits,
-                "缓存未命中": report.api_stats.cache_misses,
-                "缓存命中率": report.api_stats.cache_hit_rate,
-                "429重试": report.api_stats.retries_429,
-                "错误数": report.api_stats.errors,
-                "原始JSON目录": "; ".join(report.raw_paths) if report.raw_paths else "未保存",
-                "GMGN利润周期": report.gmgn_profit.period or "接口不支持该周期",
-                "GMGN利润状态": report.gmgn_profit.status.value,
-                "GMGN统计周期": report.gmgn_stats.period or "GMGN 未提供",
-                "任务状态": report.status.value,
-                "耗时秒": round(report.elapsed_seconds, 2),
-            }
-        ]
-        for rows in (token_rows, trade_rows, warning_rows, scope_rows, raw_rows):
+        for rows in (token_rows, trade_rows, warning_rows):
             assert_no_empty_export_cells(rows)
-        audit_rows = self._audit_rows(report)
-        conflict_rows = self._conflict_rows(report)
         provider_rows = self._provider_rows(report)
-        coverage_rows = self._coverage_rows(report)
         self._write_workbook(
             xlsx,
             [
                 ("代币分析", token_rows),
                 ("交易明细", trade_rows or [self._empty_trade_placeholder(report.request.wallet_address)]),
                 ("异常与补全", warning_rows),
-                ("原始概要", raw_rows),
-                ("数据验证", audit_rows),
-                ("冲突与缺失", conflict_rows),
                 ("数据源统计", provider_rows),
-                ("覆盖率", coverage_rows),
             ],
             hide_suffix={"代币分析": 11},
         )
@@ -347,87 +293,6 @@ class ExportService:
                     ws.column_dimensions[get_column_letter(col)].hidden = True
         wb.save(path)
 
-    def _audit_rows(self, report: WalletReport) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for token in report.tokens:
-            if token.audit_rows:
-                rows.extend(token.audit_rows)
-            else:
-                rows.append(
-                    {
-                        "钱包": token.wallet_address,
-                        "Mint": token.token_address,
-                        "字段": "首买验证状态",
-                        "最终值": token.first_buy_verify_status or "无",
-                        "状态": token.first_buy_time.status.value,
-                        "主数据源": token.first_buy_source or "无",
-                        "其它数据源": "无",
-                        "Source A Value": str(token.first_buy_time.export("text")),
-                        "Source B Value": "无",
-                        "差异": token.first_buy_time.reason or "无",
-                        "证据": token.first_buy_time.source or "无",
-                        "备注": token.acquisition.reason or "无",
-                    }
-                )
-        if not rows:
-            rows = [
-                {
-                    "钱包": report.request.wallet_address,
-                    "Mint": "无",
-                    "字段": "无",
-                    "最终值": "无 Token",
-                    "状态": "KNOWN",
-                    "主数据源": "local",
-                    "其它数据源": "无",
-                    "Source A Value": "无",
-                    "Source B Value": "无",
-                    "差异": "无",
-                    "证据": "无",
-                    "备注": "无",
-                }
-            ]
-        assert_no_empty_export_cells(rows)
-        return rows
-
-    def _conflict_rows(self, report: WalletReport) -> list[dict[str, Any]]:
-        interesting = {"CONFLICT", "UNRESOLVED", "ESTIMATED", "NOT_APPLICABLE"}
-        rows = []
-        for token in report.tokens:
-            fields = [
-                ("入场市值", token.market_cap),
-                ("创建时间", token.created_at),
-                ("当前市值", token.current_market_cap),
-                ("首笔买入", token.first_buy_display),
-                ("来源平台", token.source_platform),
-            ]
-            for name, audited in fields:
-                if audited.status.value in interesting or audited.estimated:
-                    rows.append(
-                        {
-                            "钱包": token.wallet_address,
-                            "Mint": token.token_address,
-                            "字段": name,
-                            "状态": audited.status.value,
-                            "最终值": str(audited.export("text")),
-                            "来源": audited.source,
-                            "备注": audited.reason or "无",
-                        }
-                    )
-        if not rows:
-            rows = [
-                {
-                    "钱包": report.request.wallet_address,
-                    "Mint": "无",
-                    "字段": "无",
-                    "状态": "KNOWN",
-                    "最终值": "本次无冲突或缺失",
-                    "来源": "completeness_service",
-                    "备注": "无",
-                }
-            ]
-        assert_no_empty_export_cells(rows)
-        return rows
-
     def _provider_rows(self, report: WalletReport) -> list[dict[str, Any]]:
         rows = []
         for item in report.provider_metrics or []:
@@ -480,25 +345,6 @@ class ExportService:
         rows = list(merged.values()) or [{"数据源": "无", "请求数": 0, "缓存命中": 0, "成功": 0, "429": 0, "5xx": 0, "熔断次数": 0, "降级次数": 0, "耗时秒": 0, "估算Credits": "不适用"}]
         assert_no_empty_export_cells(rows)
         return rows
-
-    def _coverage_rows(self, report: WalletReport) -> list[dict[str, Any]]:
-        cov = report.coverage or {}
-        row = {
-            "钱包": report.request.wallet_address,
-            "字段完整率": "100%",
-            "事实验证率": f"{float(cov.get('verified_rate') or 0)*100:.1f}%",
-            "估算": f"{float(cov.get('estimated_rate') or 0)*100:.1f}%",
-            "未解析": f"{float(cov.get('unresolved_rate') or 0)*100:.1f}%",
-            "VERIFIED": cov.get("verified_fields", 0),
-            "CONSENSUS": cov.get("consensus_fields", 0),
-            "DIRECT": cov.get("direct_fields", 0),
-            "DERIVED": cov.get("derived_fields", 0),
-            "ESTIMATED": cov.get("estimated_fields", 0),
-            "UNRESOLVED": cov.get("unresolved_fields", 0),
-            "CONFLICT": cov.get("conflict_fields", 0),
-        }
-        assert_no_empty_export_cells([row])
-        return [row]
 
     def _json_payload(self, report: WalletReport, token_rows: list[dict[str, Any]], trade_rows: list[dict[str, Any]]) -> dict[str, Any]:
         return {

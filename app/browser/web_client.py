@@ -7,14 +7,19 @@ from app.api.exceptions import AnalysisCancelledError, GMGNError
 from app.api.metrics import RateMetrics
 from app.api.rate_limiter import WeightedRateLimiter
 from app.browser.cookie_pool import CookiePool
-from app.browser.payloads import as_openapi_page, extract_activity_items, extract_token_mints
+from app.browser.payloads import (
+    activity_in_window,
+    activity_timestamp,
+    activity_token_labels,
+    as_openapi_page,
+)
 from app.browser.scraper import GmgnScraper
 from app.browser.session import BrowserSession
 from app.utils.logger import get_logger
 
 logger = get_logger("gmgn.web")
 OnRaw = Callable[[str, dict[str, Any]], None]
-OnEvent = Callable[[str], None]
+OnEvent = Callable[..., None]
 
 
 class _DummySafety:
@@ -81,8 +86,10 @@ class GmgnWebClient:
         self._holdings: dict[str, dict[str, Any]] = {}
         self._stats: dict[str, dict[str, Any]] = {}
         self._profits: dict[str, dict[str, Any]] = {}
+        self._drawer_metrics: dict[tuple[str, str], Any] = {}
         self._opened: set[str] = set()
         self._token_opened: set[tuple[str, str]] = set()
+        self._discovered: dict[str, list[str]] = {}
 
     def warmup(self) -> None:
         """Start the browser and reuse/login cookies before any Helius/API work."""
@@ -95,9 +102,22 @@ class GmgnWebClient:
         if session is not None:
             session.close()
 
-    def _emit(self, message: str) -> None:
+    def _emit(self, message: str, **extra: Any) -> None:
+        scraper = self._scraper
+        if scraper is not None:
+            setter = getattr(scraper, "_set_progress", None)
+            if callable(setter):
+                payload = {key: extra[key] for key in ("done", "total", "token", "stage") if key in extra}
+                if payload:
+                    setter(**payload)
+            scraper.emit(message)
+            return
         logger.info(message)
-        if self.on_event:
+        if not self.on_event:
+            return
+        try:
+            self.on_event(message, **extra)
+        except TypeError:
             self.on_event(message)
 
     def _ensure_session(self) -> GmgnScraper:
@@ -130,10 +150,23 @@ class GmgnWebClient:
             if key in self._opened:
                 return
         scraper = self._ensure_session()
+        self._emit("正在打开 GMGN 钱包页", done=0, total=100, token="", stage="browser")
         scraper.open_wallet(wallet)
         activities = scraper.scroll_until_coverage(self.start_ts)
-        tokens = scraper.unique_tokens(activities)
-        self._emit(f"去重后代币 {len(tokens)} 个，开始逐个打开详情")
+        window_acts = [item for item in activities if activity_in_window(item, self.start_ts, self.end_ts)]
+        skipped = len(activities) - len(window_acts)
+        tokens = scraper.unique_tokens(window_acts)
+        labels: list[str] = []
+        for item in window_acts:
+            for name in activity_token_labels(item):
+                if name not in labels:
+                    labels.append(name)
+        preview = "、".join(labels[:40]) if labels else "无"
+        extra_labels = f" 等{len(labels)}个" if len(labels) > 40 else ""
+        self._emit(
+            f"流水已扫 {len(activities)} 条（窗口内 {len(window_acts)}，窗口外忽略 {skipped}）"
+            f" / mint {len(tokens)}，表内代币：{preview}{extra_labels}"
+        )
         scraper._scroll_activity_top()
         with self._lock:
             self._wallet_acts[key] = list(activities)
@@ -143,13 +176,20 @@ class GmgnWebClient:
                 self._stats[key] = payload if isinstance(payload, dict) else {"data": payload}
             for payload in scraper.capture.by_kind.get("profits") or []:
                 self._profits[key] = payload if isinstance(payload, dict) else {"data": payload}
-            extra = [mint for mint in extract_token_mints(self._holdings.get(key) or {}) if mint != key]
-            from app.providers.token_universe import MAX_UNIVERSE_TOKENS
+            from app.providers.token_universe import MAX_UNIVERSE_TOKENS, is_quote_mint
 
-            merged = list(dict.fromkeys([*tokens, *extra]))[:MAX_UNIVERSE_TOKENS]
+            merged = [mint for mint in dict.fromkeys(tokens) if mint != key and not is_quote_mint(mint)]
+            merged = merged[:MAX_UNIVERSE_TOKENS]
+            self._discovered[key] = list(merged)
             self._opened.add(key)
-        for mint in merged:
+        n = len(merged)
+        self._emit(f"去重后代币 {n} 个，开始逐个打开详情", done=0, total=max(n, 1), token="", stage="browser_token")
+        for i, mint in enumerate(merged, 1):
+            shown = (scraper._labels_for_mint(mint) or [mint[:8]])[0]
+            self._emit(f"打开代币详情 {shown}（{i}/{n}）", done=i, total=n, token=shown, stage="browser_token")
             self._open_token(wallet, mint, scraper)
+        if n:
+            self._emit(f"详情已全部打开 {n}/{n}", done=n, total=n, stage="browser_token")
 
     def _open_token(self, wallet: str, mint: str, scraper: GmgnScraper) -> None:
         pair = (wallet, mint)
@@ -175,11 +215,26 @@ class GmgnWebClient:
                     "raw_drawer": detail.get("drawer_text") or "",
                 },
             }
+        drawer_metrics = detail.get("drawer_metrics") if isinstance(detail, dict) else None
         with self._lock:
             self._token_acts[pair] = token_items or [
                 item for item in self._wallet_acts.get(wallet, []) if mint in str(item)
             ]
+            if drawer_metrics is not None:
+                self._drawer_metrics[pair] = drawer_metrics
             self._token_opened.add(pair)
+
+    def discovered_tokens(self, wallet: str) -> list[str]:
+        """Tokens seen on the GMGN wallet page (activity + holdings + opened drawers)."""
+        with self._lock:
+            found = list(self._discovered.get(wallet) or [])
+            opened = [mint for (owner, mint) in self._token_opened if owner == wallet]
+        return list(dict.fromkeys([*found, *opened]))
+
+    def get_token_drawer_metrics(self, wallet: str, token_address: str) -> Optional[Any]:
+        """Per-token metrics parsed from the GMGN drawer DOM (Total Profit, Avg MC, ...)."""
+        with self._lock:
+            return self._drawer_metrics.get((wallet, token_address))
 
     def get_wallet_activity(
         self,
@@ -206,13 +261,13 @@ class GmgnWebClient:
                 ]
         else:
             items = list(self._wallet_acts.get(wallet_address, []))
-        if self.end_ts:
+        if self.start_ts or self.end_ts:
             filtered = []
-            from app.browser.payloads import activity_timestamp
-
             for item in items:
                 ts = activity_timestamp(item)
-                if ts and ts > self.end_ts:
+                if not token_address and self.start_ts and ts and ts < self.start_ts:
+                    continue
+                if self.end_ts and ts and ts > self.end_ts:
                     continue
                 filtered.append(item)
             items = filtered

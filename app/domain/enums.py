@@ -4,6 +4,7 @@ from enum import Enum
 
 
 class ReportPeriod(str, Enum):
+    D1 = "1d"
     D7 = "7d"
     D30 = "30d"
     D90 = "90d"

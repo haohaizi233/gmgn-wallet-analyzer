@@ -40,6 +40,23 @@ def _audited_or_missing(value: AuditedValue, kind: str) -> str:
     return str(exported)
 
 
+def _drawer(token: TokenAnalysisResult, attr: str, kind: str) -> Any:
+    """Read a field directly from the GMGN drawer metrics (trusted as-is)."""
+    dm = getattr(token, "drawer_metrics", None)
+    if dm is None:
+        return "未抓取抽屉"
+    value = getattr(dm, attr, None)
+    if value is None:
+        return "GMGN 未提供"
+    if kind == "int":
+        return int(value)
+    if kind == "percent":
+        return f"{value}%"
+    if kind == "usd_compact":
+        return format_usd(Decimal(value)) if Decimal(value) != 0 else "$0"
+    return str(value)
+
+
 class CompletenessService:
     def token_export_row(self, token: TokenAnalysisResult) -> dict[str, Any]:
         acq = token.acquisition
@@ -106,22 +123,15 @@ class CompletenessService:
             "买入总额": buy_total,
             "卖出笔数": token.sell_count,
             "卖出总额": sell_total,
-            "已实现盈亏": token.realized_profit.export("usd"),
-            "未实现盈亏": token.unrealized_profit.export("usd"),
             "总盈亏": token.total_profit.export("usd"),
             "总盈亏%": token.total_profit_pnl.export("percent"),
-            "本地FIFO已实现": token.fifo_realized_profit.export("usd"),
-            "当前余额": safe_export_value(token.current_balance, FieldStatus.KNOWN if token.current_balance is not None else FieldStatus.UNKNOWN, kind="amount", reason="活动推算余额"),
-            "活动推算余额": safe_export_value(
-                token.calculated_balance if token.calculated_balance is not None else token.current_balance,
-                FieldStatus.KNOWN if (token.calculated_balance is not None or token.current_balance is not None) else FieldStatus.UNKNOWN,
-                kind="amount",
-                reason="活动推算余额",
-            ),
-            "余额口径": token.balance_authority or "DERIVED_FROM_ACTIVITY",
-            "缺失成本": token.missing_cost_count,
-            "缺失成本卖出笔数": token.missing_cost_sell_count or token.missing_cost_count,
-            "缺失成本数量": safe_export_value(token.missing_cost_token_amount, FieldStatus.KNOWN if token.missing_cost_token_amount is not None else FieldStatus.NOT_APPLICABLE, kind="amount", reason="无缺失数量"),
+            "平均买入MC": _drawer(token, "avg_mc_buy", "usd_compact"),
+            "平均卖出MC": _drawer(token, "avg_mc_sell", "usd_compact"),
+            "转入总额": _drawer(token, "transfers_in_usd", "usd_compact"),
+            "转入笔数": _drawer(token, "transfers_in_txs", "int"),
+            "转出总额": _drawer(token, "transfers_out_usd", "usd_compact"),
+            "转出笔数": _drawer(token, "transfers_out_txs", "int"),
+            "余额": _drawer(token, "balance_usd", "usd_compact"),
             "Launchpad": _audited_or_missing(token.launchpad_platform, "text"),
             "资产来源": _audited_or_missing(token.asset_source, "text"),
             "流动性平台": _audited_or_missing(token.liquidity_platform, "text"),

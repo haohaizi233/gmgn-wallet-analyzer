@@ -26,6 +26,46 @@ def first_present(data: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+_QUOTE_MINTS = {
+    "SOL",
+    "So11111111111111111111111111111111111111111",
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+}
+
+
+def _usable_mint(text: str, wallet_address: str = "", *, require_solana_len: bool = False) -> bool:
+    mint = str(text or "").strip()
+    if not mint or mint == wallet_address or mint.upper() == "SOL":
+        return False
+    if mint in _QUOTE_MINTS:
+        return False
+    if len(mint) > 44:
+        return False
+    if require_solana_len:
+        return len(mint) >= 32
+    return True
+
+
+def activity_token_address(item: dict[str, Any], wallet_address: str = "") -> str:
+    """Read the token mint from GMGN activity JSON (several historical shapes)."""
+    if not isinstance(item, dict):
+        return ""
+    token = as_dict(item.get("token"))
+    for raw in (
+        first_present(item, "token_address", "base_address", "mint", "token_mint"),
+        first_present(token, "address", "token_address", "mint"),
+    ):
+        text = str(raw or "").strip()
+        if _usable_mint(text, wallet_address, require_solana_len=False):
+            return text
+    top = str(first_present(item, "address") or "").strip()
+    if _usable_mint(top, wallet_address, require_solana_len=True):
+        return top
+    return ""
+
+
 def parse_event_type(raw: Any) -> EventType:
     text = str(raw or "").strip()
     mapping = {
@@ -50,11 +90,7 @@ def parse_activity_item(item: dict[str, Any], wallet_address: str, chain: str) -
     if not isinstance(item, dict):
         return None
     token = as_dict(item.get("token"))
-    token_address = str(
-        first_present(item, "token_address", "base_address")
-        or first_present(token, "address", "token_address")
-        or ""
-    ).strip()
+    token_address = activity_token_address(item, wallet_address)
     tx_hash = str(first_present(item, "tx_hash", "transaction_hash", "hash") or "").strip()
     ts_raw = first_present(item, "timestamp", "block_unix_time", "time")
     try:
@@ -139,10 +175,17 @@ def parse_activity_page(payload: Any, wallet_address: str, chain: str) -> tuple[
     if rows is None:
         rows = data.get("list") or []
     trades: list[TradeRecord] = []
+    skipped = 0
     for item in rows:
         parsed = parse_activity_item(item, wallet_address, chain)
         if parsed is not None:
             trades.append(parsed)
+        else:
+            skipped += 1
+    if skipped:
+        from app.utils.logger import get_logger
+
+        get_logger("gmgn.parse").warning("activity page skipped %s/%s rows (no mint)", skipped, len(rows))
     nxt = data.get("next")
     if nxt in (None, "", "null"):
         return trades, None
@@ -167,6 +210,10 @@ def parse_token_info(payload: Any, token_address: str, chain: str = "sol") -> To
         pool_created_at=int(pool_created) if pool_created not in (None, "") else None,
         total_supply=to_decimal(data.get("total_supply")),
         circulating_supply=to_decimal(data.get("circulating_supply")),
+        market_cap=to_decimal(
+            first_present(data, "market_cap", "marketCap", "market_cap_usd", "marketcap")
+        ),
+        fdv=to_decimal(first_present(data, "fdv", "fully_diluted_value", "fully_diluted_val")),
         launchpad=data.get("launchpad") or None,
         launchpad_platform=data.get("launchpad_platform") or None,
         pool_exchange=pool.get("exchange") or None,
