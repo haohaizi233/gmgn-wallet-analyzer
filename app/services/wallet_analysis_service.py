@@ -15,6 +15,7 @@ from app.providers.exceptions import ProviderRateLimitError
 from app.providers.orchestrator import DataOrchestrator
 from app.providers.moralis.convert import swap_to_trade
 from app.providers.moralis.models import TokenMetadata, WalletSwapIndex
+from app.providers.result import coverage_from_swaps
 from app.resolvers.first_buy import resolve_first_buy, transfer_in_first_buy_fields
 from app.resolvers.creation import resolve_creation_times
 from app.resolvers.historical_mcap import resolve_entry_market_cap
@@ -63,7 +64,7 @@ from app.storage.repositories import Repositories
 from app.utils.logger import get_logger
 from app.utils.money import to_decimal
 from app.utils.paths import RAW_DIR
-from app.utils.time_utils import format_datetime, gmgn_profit_period, gmgn_stats_period, now_ts
+from app.utils.time_utils import format_datetime, gmgn_period_for_range, gmgn_profit_period, gmgn_stats_period, now_ts
 from app.version import __version__
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
@@ -137,7 +138,7 @@ class WalletAnalysisService:
 
         if cookie_mode:
             logger.info("自动化采集：跳过 Helius 主历史，先走 GMGN 网页")
-            self._progress("browser", "正在打开 GMGN 并采集钱包页", 0, 0, request.wallet_address, "")
+            self._progress("browser", "正在打开 GMGN 并采集钱包页", 0, 100, request.wallet_address, "")
             prepare = getattr(self.client, "prepare_wallet", None)
             if prepare:
                 prepare(request.chain, request.wallet_address)
@@ -216,7 +217,20 @@ class WalletAnalysisService:
             if extra_mints:
                 token_ids = list(dict.fromkeys(list(token_ids) + extra_mints))
             if cookie_mode:
-                logger.info("网页采集 Token=%s trades=%s pages=%s", len(token_ids), len(report_trades), pages)
+                discovered = []
+                getter = getattr(self.client, "discovered_tokens", None)
+                if callable(getter):
+                    discovered = list(getter(request.wallet_address) or [])
+                before = len(token_ids)
+                token_ids = list(dict.fromkeys(list(token_ids) + discovered))
+                logger.info(
+                    "网页采集 Token=%s trades=%s pages=%s discovered=%s merged=%s",
+                    before,
+                    len(report_trades),
+                    pages,
+                    len(discovered),
+                    len(token_ids),
+                )
         else:
             report_trades, pages, truncated = [], 0, False
             token_ids = list(dict.fromkeys(extra_mints))
@@ -355,6 +369,11 @@ class WalletAnalysisService:
                 in_window = False
             trade.in_report_range = trade.activity_fingerprint in in_range_keys or in_window
 
+        if request.period != ReportPeriod.ALL:
+            token_results = [item for item in token_results if (item.report_trade_count or 0) > 0]
+            all_trades = [item for item in all_trades if item.in_report_range]
+            failed = sum(1 for item in token_results if item.status == TaskStatus.FAILED)
+
         timestamps = [t.timestamp for t in all_trades if t.timestamp and t.in_report_range]
         summary = self._summary(token_results, all_trades, profit)
         coverage = None
@@ -362,6 +381,16 @@ class WalletAnalysisService:
             coverage = swap_index.coverage
             if coverage is None and self.orchestrator is not None:
                 coverage = getattr(self.orchestrator, "last_coverage", None)
+        if cookie_mode and coverage is None:
+            coverage = coverage_from_swaps(
+                provider=DataSource.GMGN,
+                start_ts=request.start_time,
+                end_ts=request.end_time,
+                timestamps=[t.timestamp for t in report_trades if t.timestamp],
+                pages=pages,
+                complete=not truncated,
+                success=True,
+            )
         cov_start = "无"
         cov_end = "无"
         if coverage and coverage.actual_start_ts:
@@ -557,12 +586,14 @@ class WalletAnalysisService:
         meta = (metadata_map or {}).get(token_address)
         if meta is not None:
             token_info = _token_info_from_metadata(meta, token_address, request.chain)
-        elif request.options.fetch_token_created_at or request.options.fetch_platform_pool:
+        else:
             try:
                 token_info = self.enricher.get_token_info(request.chain, token_address)
             except (GMGNRateLimitError, ProviderRateLimitError) as exc:
                 logger.warning("GMGN token_info 限流，继续: %s", exc)
                 token_info = TokenInfo(token_address=token_address, chain=request.chain, symbol=symbol, name=symbol, info_status=FieldStatus.ERROR, info_error="GMGN限流，已使用其它数据源验证")
+            except Exception as exc:
+                logger.debug("token_info 不可用 %s: %s", token_address[:8], exc)
         pairs = list((pool_map or {}).get(token_address) or [])
         if not pairs and request.options.fetch_platform_pool and self.orchestrator is not None:
             try:
@@ -615,6 +646,17 @@ class WalletAnalysisService:
         platforms = resolve_platforms(token_info, pool_info, activity_platform, autofill=request.options.autofill_missing)
         platform = platforms.display
         fifo = apply_fifo(history)
+        # Per-token metrics parsed directly from the GMGN drawer DOM (Total Profit,
+        # Avg MC B/S, Bought, Sold, ...). When present, these are GMGN's own displayed
+        # values and are preferred over local FIFO recomputation to avoid price/
+        # supply field mismatches.
+        drawer_metrics = None
+        try:
+            getter = getattr(self.client, "get_token_drawer_metrics", None)
+            if callable(getter):
+                drawer_metrics = getter(request.wallet_address, token_address)
+        except Exception as exc:
+            logger.debug("drawer_metrics 不可用 %s: %s", token_address[:8], exc)
         if request.period == ReportPeriod.ALL:
             report_token_trades = history
         else:
@@ -622,8 +664,16 @@ class WalletAnalysisService:
 
         all_buys = [t for t in history if t.event_type == EventType.BUY]
         all_sells = [t for t in history if t.event_type == EventType.SELL]
-        buy_total = _sum_optional([t.cost_usd for t in all_buys]) if all_buys else Decimal("0")
-        sell_total = _sum_optional([t.cost_usd for t in all_sells]) if all_sells else Decimal("0")
+        drawer_buy_count = drawer_metrics.bought_txs if drawer_metrics else None
+        drawer_sell_count = drawer_metrics.sold_txs if drawer_metrics else None
+        if drawer_metrics is not None and drawer_metrics.bought_usd is not None:
+            buy_total = drawer_metrics.bought_usd
+        else:
+            buy_total = _sum_optional([t.cost_usd for t in all_buys]) if all_buys else Decimal("0")
+        if drawer_metrics is not None and drawer_metrics.sold_usd is not None:
+            sell_total = drawer_metrics.sold_usd
+        else:
+            sell_total = _sum_optional([t.cost_usd for t in all_sells]) if all_sells else Decimal("0")
         buy_total_estimated = bool(all_buys) and any(getattr(t, "cost_usd_estimated", False) for t in all_buys)
         sell_total_estimated = bool(all_sells) and any(getattr(t, "cost_usd_estimated", False) for t in all_sells)
         cost_est_any = any(getattr(t, "cost_usd_estimated", False) for t in history if t.cost_usd is not None)
@@ -721,7 +771,14 @@ class WalletAnalysisService:
             first_amount = known(acq.amount, "wallet_activity.transferIn.token_amount") if acq.amount is not None else missing("wallet_activity", "无法验证")
             first_time = known(acq.timestamp, "wallet_activity.transferIn.timestamp") if acq.timestamp else missing("wallet_activity", "无首次获得时间")
 
-        if acq.market_cap is not None:
+        drawer_avg_mc_buy = drawer_metrics.avg_mc_buy if drawer_metrics else None
+        if drawer_avg_mc_buy is not None:
+            market_cap = known(
+                drawer_avg_mc_buy,
+                "gmgn_drawer.avg_mc_buy",
+                reason="GMGN 抽屉 Avg MC B/S（买入平均市值）",
+            )
+        elif acq.market_cap is not None:
             market_cap = known(
                 acq.market_cap,
                 acq.market_cap_source,
@@ -767,13 +824,31 @@ class WalletAnalysisService:
             unrealized_profit = known(Decimal("0"), "local_fifo", reason="已清仓")
         elif current_price is not None:
             remaining = fifo.remaining_cost_usd if fifo.remaining_cost_usd is not None else Decimal("0")
-            unrl = current_price * fifo.current_balance - remaining
-            unrealized_profit = known(unrl, "local_fifo", estimated=True, reason="当前价 × 余额 − 剩余成本")
+            holding_value = current_price * fifo.current_balance
+            sanity_pair = select_primary_pool(pairs, token_address) if pairs else None
+            ceiling = None
+            liquidity = None
+            if sanity_pair is not None:
+                ceiling = sanity_pair.market_cap or sanity_pair.fdv
+                liquidity = getattr(sanity_pair, "liquidity_usd", None)
+            unrealized_profit = _unrealized_profit(holding_value, remaining, ceiling, liquidity)
         else:
             unrealized_profit = missing("wallet_holdings", "当前价或剩余成本不足，无法估算未实现盈亏")
         realized_value = to_decimal(realized_profit.value) if _audited_filled(realized_profit) else None
         unrealized_value = to_decimal(unrealized_profit.value) if _audited_filled(unrealized_profit) else None
-        if realized_value is not None and unrealized_value is not None:
+        drawer_total = getattr(drawer_metrics, "total_profit", None) if drawer_metrics else None
+        drawer_pnl = getattr(drawer_metrics, "total_profit_pnl", None) if drawer_metrics else None
+        if drawer_total is not None:
+            total_profit = known(drawer_total, "gmgn_drawer", reason="GMGN 抽屉 Total Profit")
+            if drawer_pnl is not None:
+                # Drawer gives the percentage directly (e.g. -5.96 for -5.96%);
+                # export("percent") multiplies by 100, so store as a fraction.
+                total_profit_pnl = known(drawer_pnl / Decimal("100"), "gmgn_drawer", reason="GMGN 抽屉 Total Profit %")
+            elif buy_total not in (None, 0):
+                total_profit_pnl = known(drawer_total / buy_total, "gmgn_drawer", estimated=True)
+            else:
+                total_profit_pnl = known(Decimal("0"), "gmgn_drawer", estimated=True, reason="无成本基数，收益率记 0")
+        elif realized_value is not None and unrealized_value is not None:
             total_value = realized_value + unrealized_value
             total_profit = known(total_value, "local_fifo", estimated=unrealized_profit.estimated or cost_est_any)
             if buy_total not in (None, 0):
@@ -832,9 +907,9 @@ class WalletAnalysisService:
             open_at=open_at,
             pool_created_at=pool_created,
             time_diff_seconds=missing("local", "未计算"),
-            buy_count=len(all_buys),
+            buy_count=drawer_buy_count if drawer_buy_count is not None else len(all_buys),
             buy_total_usd=buy_total,
-            sell_count=len(all_sells),
+            sell_count=drawer_sell_count if drawer_sell_count is not None else len(all_sells),
             sell_total_usd=sell_total,
             buy_total_estimated=buy_total_estimated,
             sell_total_estimated=sell_total_estimated,
@@ -853,6 +928,7 @@ class WalletAnalysisService:
             status=status,
             warnings=notes or ["无"],
             position_status=position,
+            drawer_metrics=drawer_metrics,
             first_buy_display=first_buy_display,
             first_buy_amount=first_amount,
             first_buy_time=first_time,
@@ -1004,7 +1080,10 @@ class WalletAnalysisService:
         return result
 
     def _load_stats(self, request: WalletAnalysisRequest) -> GmgnWalletStats:
-        period = gmgn_stats_period(request.period)
+        if request.period == ReportPeriod.CUSTOM:
+            period = gmgn_period_for_range(request.start_time, request.end_time)
+        else:
+            period = gmgn_stats_period(request.period)
         try:
             payload = self.client.get_wallet_stats(request.chain, request.wallet_address, period)
             stats = parse_wallet_stats(payload, request.wallet_address, period)
@@ -1020,7 +1099,10 @@ class WalletAnalysisService:
             return GmgnWalletStats(request.wallet_address, period, status=FieldStatus.ERROR, reason=str(exc))
 
     def _load_profit(self, request: WalletAnalysisRequest) -> GmgnProfit:
-        native = gmgn_profit_period(request.period)
+        if request.period == ReportPeriod.CUSTOM:
+            native = gmgn_period_for_range(request.start_time, request.end_time)
+        else:
+            native = gmgn_profit_period(request.period)
         if native is None:
             reason = "接口不支持该周期（仅 1d/7d/30d/all），官方利润见此说明，不使用伪造值"
             logger.warning(reason)
@@ -1145,6 +1227,37 @@ def _audited_filled(value: AuditedValue) -> bool:
     }
 
 
+def _unrealized_profit(
+    holding_value: Decimal,
+    remaining_cost: Decimal,
+    ceiling: Optional[Decimal],
+    liquidity: Optional[Decimal],
+) -> AuditedValue:
+    """Compute unrealized P&L with a sanity ceiling against bogus price feeds.
+
+    A wallet's holding value cannot exceed the token's current market cap / FDV,
+    and cannot realistically exceed pool liquidity by a huge factor. If either
+    fails, the price feed is bogus (rug-pulled / illiquid pool reporting a stale
+    or micro-liquidity-inflated price); mark unverifiable instead of emitting
+    hundred-million-dollar paper gains.
+    """
+    bogus = False
+    reason = ""
+    if ceiling is not None and ceiling > 0 and holding_value > ceiling:
+        bogus = True
+        reason = f"持仓估值 ${holding_value:,.2f} > 代币市值 ${ceiling:,.2f}"
+    elif liquidity is not None and liquidity > 0 and holding_value > liquidity * Decimal("1000"):
+        bogus = True
+        reason = f"持仓估值 ${holding_value:,.2f} 远超池子流动性 ${liquidity:,.2f}"
+    elif liquidity is not None and liquidity < Decimal("1000") and holding_value > Decimal("10000"):
+        bogus = True
+        reason = f"池子流动性仅 ${liquidity:,.2f}，持仓估值 ${holding_value:,.2f} 不可信"
+    if bogus:
+        return missing("market", f"当前价异常（{reason}，疑似流动性枯竭/Rug），未实现盈亏不可信")
+    unrl = holding_value - remaining_cost
+    return known(unrl, "local_fifo", estimated=True, reason="当前价 × 余额 − 剩余成本")
+
+
 def _derive_current_price(pool_info, pairs, token_info, meta, token_address):
     if pool_info is not None and getattr(pool_info, "price", None) not in (None, 0):
         return pool_info.price
@@ -1210,6 +1323,8 @@ def _token_info_from_metadata(meta: TokenMetadata, token_address: str, chain: st
         name=name,
         total_supply=meta.total_supply_formatted or meta.total_supply,
         circulating_supply=meta.circulating_supply,
+        market_cap=meta.market_cap,
+        fdv=meta.fully_diluted_value,
         raw=meta.raw,
         info_status=FieldStatus.KNOWN,
     )

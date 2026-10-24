@@ -4,6 +4,32 @@ import customtkinter as ctk
 
 from app.gui.theme import MUTED, PANEL, PRIMARY, TEXT, font
 
+IDLE_PROGRESS = frozenset({"等待开始", "已取消", "分析失败"})
+
+
+def coalesce_progress(
+    message: str,
+    done: int,
+    total: int,
+    sticky: tuple[int, int] | None,
+) -> tuple[int, int, tuple[int, int] | None, str, float]:
+    """Keep a running bar when noisy browser logs arrive without done/total."""
+    done = int(done or 0)
+    total = int(total or 0)
+    text = message or "分析中"
+    if total > 0:
+        sticky = (max(0, done), total)
+    elif text in IDLE_PROGRESS:
+        sticky = None
+        done, total = 0, 0
+    elif sticky:
+        done, total = sticky
+    if total > 0:
+        return done, total, sticky, f"{done} / {total}", min(1.0, done / total)
+    if text in IDLE_PROGRESS:
+        return 0, 0, None, text, 0.0
+    return 0, 0, sticky, "进行中", 0.12
+
 
 class ProgressPanel(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
@@ -19,15 +45,17 @@ class ProgressPanel(ctk.CTkFrame):
         self.bar = ctk.CTkProgressBar(self, height=8)
         self.bar.pack(fill="x", padx=10, pady=(8, 12))
         self.bar.set(0)
-        self.count = ctk.CTkLabel(self, text="0 / 0", font=font(12), text_color=MUTED, anchor="e")
+        self.count = ctk.CTkLabel(self, text="等待开始", font=font(12), text_color=MUTED, anchor="e")
         self.count.pack(fill="x", padx=10, pady=(0, 10))
         self._keys = "Keys：-"
         self._sources = "数据源：等待任务"
         self._last_progress: tuple | None = None
         self._last_api = "API 正常"
+        self._sticky: tuple[int, int] | None = None
 
     def update_progress(self, message: str, done: int, total: int, wallet: str = "", token: str = "", api: str = "") -> None:
-        key = (message or "分析中", int(done), int(total), wallet or "-", token or "-", api or "")
+        done, total, self._sticky, count, fraction = coalesce_progress(message, done, total, self._sticky)
+        key = (message or "分析中", done, total, wallet or "-", token or "-", api or "", count)
         if key == self._last_progress:
             return
         self._last_progress = key
@@ -36,10 +64,9 @@ class ProgressPanel(ctk.CTkFrame):
         if api and api != self._last_api:
             self.api_label.configure(text=api)
             self._last_api = api
-        count = f"{done} / {total}" if total else "准备中"
         if self.count.cget("text") != count:
             self.count.configure(text=count)
-        self.bar.set(min(1.0, done / total) if total else 0)
+        self.bar.set(fraction)
 
     def set_api(self, text: str) -> None:
         text = text or "API 正常"
@@ -67,6 +94,7 @@ class ProgressPanel(ctk.CTkFrame):
 
     def reset(self) -> None:
         self._last_progress = None
+        self._sticky = None
         self.update_progress("等待开始", 0, 0)
         self.set_keys("Keys：-")
         self.set_sources("数据源：等待任务")

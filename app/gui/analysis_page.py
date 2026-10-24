@@ -19,7 +19,7 @@ from app.gui.theme import BG, DANGER, MUTED, PANEL, PRIMARY, TEXT, font
 from app.gui.worker import AnalysisWorker
 from app.services.completeness_service import CompletenessService
 from app.utils.paths import INPUT_DIR, OUTPUT_DIR, default_wallet_file, open_in_explorer, read_wallet_file, write_wallet_file
-from app.utils.time_utils import LOCAL_TZ, format_elapsed, period_window
+from app.utils.time_utils import LOCAL_TZ, format_datetime, format_elapsed, period_window
 from app.utils.validators import parse_wallet_lines, short_address, summarize_wallet_input
 
 TOKEN_COLUMNS = [
@@ -39,9 +39,7 @@ TOKEN_COLUMNS = [
     ("buy_usd", "买入总额", 110),
     ("sells", "卖出笔数", 70),
     ("sell_usd", "卖出总额", 110),
-    ("realized", "已实现盈亏", 120),
     ("pnl", "总盈亏%", 90),
-    ("missing", "缺失成本", 70),
     ("status", "状态", 80),
 ]
 TRADE_COLUMNS = [
@@ -80,7 +78,7 @@ class AnalysisPage(ctk.CTkFrame):
         self.cancel_event = threading.Event()
         self.reports: list[WalletReport] = []
         self.current: Optional[WalletReport] = None
-        self.period = ReportPeriod.D7
+        self.period = ReportPeriod.D1
         self.job_id: Optional[str] = None
         self.page_key = "analysis"
 
@@ -120,7 +118,7 @@ class AnalysisPage(ctk.CTkFrame):
         period_bar = ctk.CTkFrame(form, fg_color="transparent")
         period_bar.pack(fill="x", padx=16)
         self.period_buttons = {}
-        for key, label in [(ReportPeriod.D7, "最近 7 天"), (ReportPeriod.D30, "最近 30 天")]:
+        for key, label in [(ReportPeriod.D1, "最近 1 天"), (ReportPeriod.D7, "最近 7 天"), (ReportPeriod.D30, "最近 30 天")]:
             btn = ctk.CTkButton(period_bar, text=label, height=28, command=lambda k=key: self._set_period(k))
             btn.pack(side="left", expand=True, fill="x", padx=2)
             self.period_buttons[key] = btn
@@ -128,11 +126,16 @@ class AnalysisPage(ctk.CTkFrame):
         date_row.pack(fill="x", padx=16, pady=6)
         self.start_var = ctk.StringVar()
         self.end_var = ctk.StringVar()
+        self._suppress_manual_date = False
         ctk.CTkLabel(date_row, text="开始", font=font(12), text_color=MUTED).grid(row=0, column=0, sticky="w")
         ctk.CTkEntry(date_row, textvariable=self.start_var, width=130).grid(row=1, column=0, padx=(0, 8))
         ctk.CTkLabel(date_row, text="结束", font=font(12), text_color=MUTED).grid(row=0, column=1, sticky="w")
         ctk.CTkEntry(date_row, textvariable=self.end_var, width=130).grid(row=1, column=1)
-        self._set_period(ReportPeriod.D7)
+        self.period_hint = ctk.CTkLabel(form, text="", font=font(11), text_color=MUTED, anchor="w")
+        self.period_hint.pack(fill="x", padx=16, pady=(0, 4))
+        self.start_var.trace_add("write", lambda *_a: self._on_manual_date())
+        self.end_var.trace_add("write", lambda *_a: self._on_manual_date())
+        self._set_period(ReportPeriod.D1)
 
         self.opt_created = ctk.BooleanVar(value=True)
         self.opt_platform = ctk.BooleanVar(value=True)
@@ -183,7 +186,6 @@ class AnalysisPage(ctk.CTkFrame):
             ("open", "当前持仓数"),
             ("gas", "Gas 总费用"),
             ("special", "特殊获得资产数"),
-            ("missing", "缺失成本数"),
         ]:
             card = StatCard(cards, title)
             card.pack(side="left", expand=True, fill="x", padx=4)
@@ -223,7 +225,7 @@ class AnalysisPage(ctk.CTkFrame):
 
         self.token_table = DataTable(self.token_tab, TOKEN_COLUMNS, on_fullscreen=self.toggle_results_fullscreen)
         self.token_table.pack(fill="both", expand=True)
-        self.token_table.set_filters(["全部", "有盈利", "亏损", "缺失成本", "特殊获得", "非 Launchpad", "仍持仓", "已清仓"])
+        self.token_table.set_filters(["全部", "有盈利", "亏损", "特殊获得", "非 Launchpad", "仍持仓", "已清仓"])
         self.trade_table = DataTable(self.trade_tab, TRADE_COLUMNS, on_fullscreen=self.toggle_results_fullscreen)
         self.trade_table.pack(fill="both", expand=True)
         self.trade_table.set_filters(["全部", "buy", "sell", "transferIn", "transferOut"])
@@ -231,7 +233,7 @@ class AnalysisPage(ctk.CTkFrame):
         self.pos_table.pack(fill="both", expand=True)
         self.pnl_table = DataTable(
             self.pnl_tab,
-            [("symbol", "币种", 90), ("address", "代币合约", 140), ("fifo", "本地FIFO已实现", 140), ("gmgn", "GMGN说明", 280), ("missing", "缺失成本", 80), ("status", "状态", 90)],
+            [("symbol", "币种", 90), ("address", "代币合约", 140), ("fifo", "本地FIFO已实现", 140), ("gmgn", "GMGN说明", 280), ("status", "状态", 90)],
             on_fullscreen=self.toggle_results_fullscreen,
         )
         self.pnl_table.pack(fill="both", expand=True)
@@ -465,9 +467,30 @@ class AnalysisPage(ctk.CTkFrame):
         for key, btn in self.period_buttons.items():
             btn.configure(fg_color=PRIMARY if key == period else "#E5E7EB", text_color="#FFFFFF" if key == period else TEXT)
         now = datetime.now(tz=LOCAL_TZ)
-        start = now - timedelta(days=30 if period == ReportPeriod.D30 else 7)
+        days = {ReportPeriod.D1: 1, ReportPeriod.D7: 7, ReportPeriod.D30: 30}.get(period, 7)
+        start = now - timedelta(days=days)
+        self._suppress_manual_date = True
         self.start_var.set(start.strftime("%Y-%m-%d"))
         self.end_var.set(now.strftime("%Y-%m-%d"))
+        self._suppress_manual_date = False
+        hints = {
+            ReportPeriod.D1: "按当前时刻往前滚动 24 小时，不含 24 小时以前的成交",
+            ReportPeriod.D7: "按当前时刻往前滚动 7 天（7×24 小时）",
+            ReportPeriod.D30: "按当前时刻往前滚动 30 天",
+        }
+        if getattr(self, "period_hint", None) is not None:
+            self.period_hint.configure(text=hints.get(period, "自定义日期按开始日 00:00 到结束日 23:59:59"))
+
+    def _on_manual_date(self) -> None:
+        if self._suppress_manual_date:
+            return
+        if self.period == ReportPeriod.CUSTOM:
+            return
+        self.period = ReportPeriod.CUSTOM
+        for btn in self.period_buttons.values():
+            btn.configure(fg_color="#E5E7EB", text_color=TEXT)
+        if getattr(self, "period_hint", None) is not None:
+            self.period_hint.configure(text="自定义日期按开始日 00:00 到结束日 23:59:59")
 
     def _set_wallet_text(self, text: str) -> None:
         self.wallet_text.delete("1.0", "end")
@@ -518,12 +541,24 @@ class AnalysisPage(ctk.CTkFrame):
         if not getattr(self.app.config, "helius_api_key", ""):
             self.app.log_panel.append("Helius: NOT CONFIGURED (Optional)", "INFO")
         try:
-            start = datetime.strptime(self.start_var.get().strip(), "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
-            end = datetime.strptime(self.end_var.get().strip() + " 23:59:59", "%Y-%m-%d %H:%M:%S").replace(tzinfo=LOCAL_TZ)
+            if self.period == ReportPeriod.CUSTOM:
+                start = datetime.strptime(self.start_var.get().strip(), "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
+                end = datetime.strptime(self.end_var.get().strip() + " 23:59:59", "%Y-%m-%d %H:%M:%S").replace(tzinfo=LOCAL_TZ)
+                start_ts, end_ts = period_window(self.period, start, end)
+            else:
+                start_ts, end_ts = period_window(self.period)
         except ValueError:
             messagebox.showerror("日期错误", "开始/结束日期格式应为 YYYY-MM-DD")
             return
-        start_ts, end_ts = period_window(self.period, start, end)
+        if self.period == ReportPeriod.D1:
+            window_desc = "最近 24 小时（滚动）"
+        elif self.period == ReportPeriod.CUSTOM:
+            window_desc = "自定义自然日"
+        else:
+            window_desc = f"滚动 {self.period.value}"
+        self.app.log_panel.append(
+            f"报告窗口：{window_desc} {format_datetime(start_ts)} → {format_datetime(end_ts)}"
+        )
         options = AnalysisOptions(
             fetch_token_created_at=self.opt_created.get(),
             fetch_platform_pool=self.opt_platform.get(),
@@ -569,8 +604,9 @@ class AnalysisPage(ctk.CTkFrame):
         self.stop_btn.configure(state="normal")
         mode = "单钱包" if len(wallets) == 1 else f"批量 · {len(wallets)} 钱包"
         self.app.set_job_status(f"任务：{self.job_id[:8]} · RUNNING · {mode}")
-        self.progress.set_sources("数据源：运行中")
-        self.app.set_source_status("数据源：运行中")
+        source_text = "数据源：GMGN 网页自动化" if collect_mode == "automation" else "数据源：运行中"
+        self.progress.set_sources(source_text)
+        self.app.set_source_status(source_text)
         self.progress.update_progress(f"开始分析 · {mode}", 0, len(wallets), wallets[0], "")
         self.wallet_table.set_rows(
             [
@@ -618,20 +654,21 @@ class AnalysisPage(ctk.CTkFrame):
         if kind in ("WALLET_STARTED", "WALLET_WAITING_API", "RATE_LIMITED", "KEY_RECOVERED", "wallet_done"):
             self._append_run_log(f"{kind} {wallet} {msg.get('message') or ''}".strip())
         if kind == "progress":
+            stage = str(msg.get("stage") or "RUNNING")
+            token_raw = str(msg.get("token") or "")
+            token_shown = short_address(token_raw) if len(token_raw) > 16 else token_raw
             self.progress.update_progress(
                 msg.get("message", ""),
                 int(msg.get("done") or 0),
                 int(msg.get("total") or 0),
                 short_address(wallet),
-                short_address(msg.get("token") or ""),
+                token_shown,
             )
-            self._patch_wallet(
-                wallet,
-                state="RUNNING",
-                done=int(msg.get("done") or 0),
-                tokens=int(msg.get("total") or 0),
-                stage=str(msg.get("stage") or "RUNNING"),
-            )
+            patch = {"state": "RUNNING", "stage": stage}
+            if stage in {"token", "first_buy", "browser_token"}:
+                patch["done"] = int(msg.get("done") or 0)
+                patch["tokens"] = int(msg.get("total") or 0)
+            self._patch_wallet(wallet, **patch)
         elif kind == "api_state":
             text = str(msg.get("state") or "API 正常")
             self.progress.set_api(text)
@@ -740,14 +777,11 @@ class AnalysisPage(ctk.CTkFrame):
         self.cards["open"].set_value(str(s.open_positions))
         self.cards["gas"].set_value(str(s.gas_total_usd.export("usd_compact")))
         self.cards["special"].set_value(str(s.special_acquisition_count))
-        self.cards["missing"].set_value(str(s.missing_cost_count))
         complete = self._complete
         token_rows = []
         for idx, token in enumerate(report.tokens, start=1):
             row = complete.token_export_row(token)
             filters = ["全部"]
-            if token.missing_cost_count:
-                filters.append("缺失成本")
             if token.acquisition.acquisition_type.value != "BUY":
                 filters.append("特殊获得")
             if str(token.source_platform.export("text")) in {"非 Launchpad", "未知来源"}:
@@ -784,9 +818,7 @@ class AnalysisPage(ctk.CTkFrame):
                     "buy_usd": row["买入总额"],
                     "sells": row["卖出笔数"],
                     "sell_usd": row["卖出总额"],
-                    "realized": row["本地FIFO已实现"],
                     "pnl": row["总盈亏%"],
-                    "missing": row["缺失成本"],
                     "status": row["状态"],
                     "_copy": token.token_address,
                     "_filters": " ".join(filters),
@@ -832,7 +864,6 @@ class AnalysisPage(ctk.CTkFrame):
                     "address": short_address(t.token_address),
                     "fifo": t.fifo_realized_profit.export("usd"),
                     "gmgn": t.realized_profit.export("text"),
-                    "missing": t.missing_cost_count,
                     "status": t.status.value,
                     "_copy": t.token_address,
                 }

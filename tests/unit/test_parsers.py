@@ -64,6 +64,36 @@ class CollectorCursorTests(unittest.TestCase):
 
 
 class MarketCapParserTests(unittest.TestCase):
+    def test_activity_item_reads_top_level_address_as_mint(self):
+        from app.api.parsers import parse_activity_item
+
+        item = {
+            "event_type": "buy",
+            "tx_hash": "txAddr",
+            "timestamp": 1757800000,
+            "token_amount": "2",
+            "cost_usd": "10",
+            "address": "MintAddr11111111111111111111111111111111",
+            "symbol": "BABA",
+        }
+        trade = parse_activity_item(item, "WalletOwner1111111111111111111111111111111", "sol")
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertEqual(trade.token_address, "MintAddr11111111111111111111111111111111")
+        self.assertEqual(trade.token_symbol, "BABA")
+
+    def test_activity_item_ignores_wallet_address_field(self):
+        from app.api.parsers import parse_activity_item
+
+        wallet = "WalletOwner1111111111111111111111111111111"
+        item = {
+            "event_type": "buy",
+            "tx_hash": "txW",
+            "timestamp": 1757800000,
+            "address": wallet,
+        }
+        self.assertIsNone(parse_activity_item(item, wallet, "sol"))
+
     def test_activity_item_reads_market_cap_directly(self):
         from app.api.parsers import parse_activity_item
 
@@ -124,6 +154,58 @@ class MarketCapParserTests(unittest.TestCase):
         self.assertEqual(acq.market_cap, Decimal("411950"))
         self.assertFalse(acq.market_cap_is_estimated)
         self.assertEqual(acq.market_cap_source, "wallet_activity.market_cap")
+
+    def test_transfer_in_with_zero_price_uses_current_mc(self):
+        from app.domain.enums import AcquisitionType
+        from app.domain.models import TokenInfo
+        from app.services.acquisition_resolver import resolve_acquisition
+
+        class FakeTrade:
+            event_type = None
+            timestamp = 0
+            tx_hash = "tx_in"
+            token_amount = Decimal("11.87")
+            price_usd = Decimal("0")
+            cost_usd = Decimal("1790")
+            cost_sol = None
+            gas_usd = Decimal("0.001")
+            gas_sol = None
+            total_supply_at_trade = Decimal("1000000000000")
+            market_cap = None
+            cost_sol_estimated = False
+
+        transfer = FakeTrade()
+        transfer.event_type = EventType.TRANSFER_IN
+        transfer.timestamp = 1757800000
+        info = TokenInfo(
+            token_address="MintSTONK",
+            chain="sol",
+            symbol="STONK",
+            name="STONK",
+            total_supply=Decimal("1000000000000"),
+            market_cap=Decimal("150970000000"),
+        )
+        acq = resolve_acquisition([transfer], token_info=info, detect_special=False)
+        self.assertEqual(acq.acquisition_type, AcquisitionType.TRANSFER_IN)
+        self.assertEqual(acq.market_cap, Decimal("150970000000"))
+        self.assertTrue(acq.market_cap_is_estimated)
+        self.assertEqual(acq.market_cap_source, "token_info.current_market_cap")
+
+    def test_token_info_parses_current_market_cap(self):
+        info = parse_token_info(
+            {
+                "address": "MintX",
+                "symbol": "X",
+                "name": "X",
+                "total_supply": "1000000000",
+                "market_cap": "151000000000",
+                "fdv": "151200000000",
+            },
+            "MintX",
+            "sol",
+        )
+        self.assertEqual(info.market_cap, Decimal("151000000000"))
+        self.assertEqual(info.fdv, Decimal("151200000000"))
 
 
 if __name__ == "__main__":
