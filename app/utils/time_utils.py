@@ -71,24 +71,32 @@ def format_clock(ts: Optional[int | float]) -> str:
 
 
 def period_window(period: ReportPeriod, start: Optional[datetime] = None, end: Optional[datetime] = None) -> tuple[int, int]:
-    end_dt = end or datetime.now(tz=LOCAL_TZ)
+    now = datetime.now(tz=LOCAL_TZ)
     if period == ReportPeriod.CUSTOM:
         if start is None:
             raise ValueError("自定义时间必须提供开始日期")
-        return to_unix(start), to_unix(end_dt)
+        return to_unix(start), to_unix(end or now)
     if period == ReportPeriod.ALL:
-        return 0, to_unix(end_dt)
+        return 0, to_unix(end or now)
     days = {
+        ReportPeriod.D1: 1,
         ReportPeriod.D7: 7,
         ReportPeriod.D30: 30,
         ReportPeriod.D90: 90,
     }[period]
+    end_dt = end or now
+    # 「最近 N 天」is a rolling window from now. The GUI date boxes only store
+    # calendar days and pass today 23:59:59 as `end`; using that unclamped would
+    # start a 1-day window at yesterday 23:59:59 and drop 21h–22h-ago trades.
+    if end_dt > now:
+        end_dt = now
     start_dt = end_dt - timedelta(days=days)
     return to_unix(start_dt), to_unix(end_dt)
 
 
 def gmgn_profit_period(period: ReportPeriod) -> Optional[str]:
     mapping = {
+        ReportPeriod.D1: "7d",
         ReportPeriod.D7: "7d",
         ReportPeriod.D30: "30d",
         ReportPeriod.ALL: "all",
@@ -97,13 +105,25 @@ def gmgn_profit_period(period: ReportPeriod) -> Optional[str]:
 
 
 def gmgn_stats_period(period: ReportPeriod) -> str:
-    if period == ReportPeriod.D7:
+    if period in (ReportPeriod.D1, ReportPeriod.D7):
         return "7d"
     if period in (ReportPeriod.D30, ReportPeriod.D90):
         return "30d"
     if period == ReportPeriod.ALL:
         return "30d"
     return "7d"
+
+
+def gmgn_period_for_range(start_ts: int, end_ts: int) -> str:
+    """Pick the closest GMGN-supported period for a custom date range."""
+    if start_ts <= 0:
+        return "all"
+    span_days = max(1, (end_ts - start_ts) // 86400)
+    if span_days <= 7:
+        return "7d"
+    if span_days <= 30:
+        return "30d"
+    return "all"
 
 
 def format_elapsed(seconds: float) -> str:

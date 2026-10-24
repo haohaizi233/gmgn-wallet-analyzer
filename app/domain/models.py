@@ -111,7 +111,7 @@ class AnalysisOptions:
 class WalletAnalysisRequest:
     wallet_address: str
     chain: str = "sol"
-    period: ReportPeriod = ReportPeriod.D7
+    period: ReportPeriod = ReportPeriod.D1
     start_time: int = 0
     end_time: int = 0
     max_transactions: int = 2500
@@ -176,6 +176,8 @@ class TokenInfo:
     pool_created_at: Optional[int] = None
     total_supply: Optional[Decimal] = None
     circulating_supply: Optional[Decimal] = None
+    market_cap: Optional[Decimal] = None
+    fdv: Optional[Decimal] = None
     launchpad: Optional[str] = None
     launchpad_platform: Optional[str] = None
     pool_exchange: Optional[str] = None
@@ -323,6 +325,7 @@ class TokenAnalysisResult:
     pnl_verify_status: str = "UNRESOLVED"
     audit_rows: list[dict[str, Any]] = field(default_factory=list)
     buy_total_estimated: bool = False
+    drawer_metrics: Any = None
     sell_total_estimated: bool = False
 
 

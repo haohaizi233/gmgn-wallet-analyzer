@@ -8,6 +8,7 @@ from pathlib import Path
 from app.browser.cookie_pool import HEALTHY, CookiePool, has_login_cookies
 from app.browser.payloads import (
     as_openapi_page,
+    activity_in_window,
     activity_token_labels,
     classify_url,
     extract_activity_items,
@@ -157,6 +158,14 @@ class PayloadTests(unittest.TestCase):
             ["QQQx", "QQQ"],
         )
         self.assertEqual(activity_token_labels({"symbol": "BABA"}), ["BABA"])
+
+    def test_activity_in_window_keeps_22h_drops_36h(self):
+        now = 1_800_000_000
+        start_ts = now - 86400
+        inside = {"timestamp": now - 22 * 3600, "symbol": "STRID"}
+        outside = {"timestamp": now - 36 * 3600, "symbol": "OLD"}
+        self.assertTrue(activity_in_window(inside, start_ts, now))
+        self.assertFalse(activity_in_window(outside, start_ts, now))
 
     def test_classify_url(self):
         self.assertEqual(classify_url("https://gmgn.ai/api/v1/wallet_activity/sol"), "activity")
@@ -452,6 +461,170 @@ class ActivityWheelTests(unittest.TestCase):
         self.assertIn("采集中断", str(ctx.exception))
         self.assertNotIn("登录未完成", str(ctx.exception))
 
+    def test_scroll_until_coverage_waits_for_api_to_catch_up(self):
+        """Coverage must not be declared while the DOM has more rows than the API captured."""
+        from app.browser.scraper import GmgnScraper
+
+        class Page:
+            def __init__(self) -> None:
+                self.url = "https://gmgn.ai/sol/address/abc"
+
+            def is_closed(self):
+                return False
+
+            def wait_for_timeout(self, _ms):
+                return None
+
+        class Session:
+            def __init__(self, page) -> None:
+                self.page = page
+
+        events: list[str] = []
+        scraper = GmgnScraper.__new__(GmgnScraper)
+        scraper.session = Session(Page())
+        scraper.cancel_event = None
+        scraper.emit = events.append
+        scraper._check = lambda: None
+        scraper._listening = True
+        scraper.attach = lambda: None  # type: ignore
+        scraper._reveal_activity_table = lambda: None  # type: ignore
+        scraper._wheel_activity = lambda _delta: None  # type: ignore
+        scraper._unstick_activity_scroll = lambda: None  # type: ignore
+
+        # Simulate API lagging behind DOM: rows grow faster than captured activities.
+        # start_ts is large enough that oldest enters the window early, but the API
+        # count is still behind the DOM row count. Coverage must NOT fire until the
+        # API catches up and stays stable for two rounds.
+        call_state = {"i": 0}
+
+        class FakeCapture:
+            def activities(self):
+                i = call_state["i"]
+                call_state["i"] += 1
+                phases = [
+                    (50, 100),  # round 1: API=50, DOM=100 (lagging)
+                    (50, 100),  # round 2: still lagging
+                    (100, 100),  # round 3: caught up
+                    (100, 100),  # round 4: stable -> covered after 2 confirms
+                ]
+                count = phases[min(i, len(phases) - 1)][0]
+                # timestamp=100 is older than start_ts=500, so the window is "covered"
+                return [{"timestamp": 100, "token_address": "x"} for _ in range(count)]
+
+        scraper.capture = FakeCapture()
+
+        def fake_row_count():
+            i = call_state["i"] - 1
+            return [100, 100, 100, 100][min(i, 3)]
+
+        scraper._row_count = fake_row_count  # type: ignore
+
+        scraper.scroll_until_coverage(start_ts=500, max_rounds=10)
+        # Should NOT have stopped at round 1 or 2 (API lagging), only after 2 confirms.
+        self.assertTrue(any("接口落后于表格" in m for m in events))
+        self.assertTrue(any("已同步" in m or "已覆盖且接口已同步" in m for m in events))
+
+    def test_scroll_keeps_loading_until_22h_rows_for_24h_window(self):
+        """A rolling 1-day window must not stop after a few hours of history."""
+        from app.browser.scraper import GmgnScraper
+
+        class Page:
+            def is_closed(self):
+                return False
+
+            def wait_for_timeout(self, _ms):
+                return None
+
+        class Session:
+            def __init__(self, page) -> None:
+                self.page = page
+
+        events: list[str] = []
+        scraper = GmgnScraper.__new__(GmgnScraper)
+        scraper.session = Session(Page())
+        scraper.cancel_event = None
+        scraper.emit = events.append
+        scraper._check = lambda: None
+        scraper._listening = True
+        scraper.attach = lambda: None  # type: ignore
+        scraper._reveal_activity_table = lambda: None  # type: ignore
+        scraper._wheel_activity = lambda _delta: None  # type: ignore
+        scraper._unstick_activity_scroll = lambda: None  # type: ignore
+        scraper._activity_scan_hint = lambda: {}  # type: ignore
+
+        now = 1_800_000_000
+        start_ts = now - 86400
+        call_state = {"i": 0}
+        phases = [
+            [{"timestamp": now - 3600, "symbol": "NEW", "token_address": "MintNew11111111111111111111111111111111"}],
+            [{"timestamp": now - 3 * 3600, "symbol": "MID", "token_address": "MintMid11111111111111111111111111111111"}] * 100,
+            [{"timestamp": now - 3 * 3600, "symbol": "MID", "token_address": "MintMid11111111111111111111111111111111"}] * 100,
+            [{"timestamp": now - 22 * 3600, "symbol": "STRID", "token_address": "MintStrid111111111111111111111111111111"}] * 140,
+            [{"timestamp": now - 22 * 3600, "symbol": "STRID", "token_address": "MintStrid111111111111111111111111111111"}] * 140,
+            [{"timestamp": now - 25 * 3600, "symbol": "OLD", "token_address": "MintOld11111111111111111111111111111111"}] * 180,
+            [{"timestamp": now - 25 * 3600, "symbol": "OLD", "token_address": "MintOld11111111111111111111111111111111"}] * 180,
+        ]
+
+        class FakeCapture:
+            def activities(self):
+                i = call_state["i"]
+                call_state["i"] += 1
+                return list(phases[min(i, len(phases) - 1)])
+
+        scraper.capture = FakeCapture()
+
+        def fake_row_count():
+            i = max(0, call_state["i"] - 1)
+            return len(phases[min(i, len(phases) - 1)])
+
+        scraper._row_count = fake_row_count  # type: ignore
+
+        scraper.scroll_until_coverage(start_ts=start_ts, max_rounds=12)
+        joined = "\n".join(events)
+        self.assertIn("STRID", joined)
+        self.assertTrue(any("已覆盖且接口已同步" in m for m in events))
+        self.assertFalse(any("已覆盖且接口已同步" in m and "100 条" in m for m in events))
+
+
+class WindowScrollProgressTests(unittest.TestCase):
+    def test_22h_into_24h_window_is_mostly_filled(self):
+        from app.browser.scraper import window_scroll_progress
+
+        now = 1_800_000_000
+        start_ts = now - 86400
+        oldest = now - 22 * 3600
+        done, total = window_scroll_progress(start_ts, oldest, 3, 80, now=now)
+        self.assertEqual(total, 100)
+        self.assertGreaterEqual(done, 90)
+        self.assertLess(done, 100)
+
+    def test_past_window_is_complete(self):
+        from app.browser.scraper import window_scroll_progress
+
+        now = 1_800_000_000
+        done, total = window_scroll_progress(now - 86400, now - 90000, 8, 80, now=now)
+        self.assertEqual((done, total), (100, 100))
+
+
+class ScraperProgressEmitTests(unittest.TestCase):
+    def test_emit_forwards_done_total_to_on_event(self):
+        from app.browser.scraper import GmgnScraper
+
+        seen: list[tuple] = []
+
+        def on_event(message: str, **extra):
+            seen.append((message, extra.get("done"), extra.get("total"), extra.get("stage")))
+
+        scraper = GmgnScraper.__new__(GmgnScraper)
+        scraper.on_event = on_event
+        scraper._pg_done = 0
+        scraper._pg_total = 0
+        scraper._pg_token = ""
+        scraper._pg_stage = "browser"
+        scraper._set_progress(done=5, total=23, token="STRID", stage="browser_token")
+        scraper.emit("打开代币详情 STRID（5/23）")
+        self.assertEqual(seen[-1], ("打开代币详情 STRID（5/23）", 5, 23, "browser_token"))
+
 
 class SessionNavTests(unittest.TestCase):
     def test_goto_timeout_is_network_error(self):
@@ -568,6 +741,28 @@ class WebClientPagingTests(unittest.TestCase):
         page2 = client.get_wallet_activity("sol", "Wallet111", cursor="1", limit=1)
         self.assertEqual(page2["data"]["activities"][0]["tx_hash"], "b")
         self.assertIsNone(page2["data"]["next"])
+
+    def test_wallet_activity_drops_rows_before_start_ts(self):
+        from app.browser.web_client import GmgnWebClient
+
+        now = 1_800_000_000
+        client = GmgnWebClient.__new__(GmgnWebClient)
+        client.request_count = 0
+        client.start_ts = now - 86400
+        client.end_ts = now
+        client._wallet_acts = {
+            "Wallet111": [
+                {"tx_hash": "in", "timestamp": now - 10 * 3600, "event_type": "buy", "symbol": "STRID"},
+                {"tx_hash": "old", "timestamp": now - 36 * 3600, "event_type": "sell", "symbol": "OLD"},
+            ]
+        }
+        client._opened = {"Wallet111"}
+        client._token_acts = {}
+        client._token_opened = set()
+        client.prepare_wallet = lambda *a, **k: None  # type: ignore
+        page = client.get_wallet_activity("sol", "Wallet111", limit=50)
+        hashes = [row["tx_hash"] for row in page["data"]["activities"]]
+        self.assertEqual(hashes, ["in"])
 
     def test_cookie_mode_analyze_does_not_call_helius_history(self):
         from unittest.mock import MagicMock

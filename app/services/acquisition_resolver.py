@@ -1,12 +1,37 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from app.domain.enums import AcquisitionStatus, AcquisitionType, EventType, FieldStatus
 from app.domain.models import AcquisitionInfo, TokenInfo, TradeRecord
 from app.services.special_assets import lookup_special_asset
 from app.utils.money import to_decimal
+
+logger = logging.getLogger(__name__)
+
+
+def _dump_raw_fields(trade: TradeRecord) -> None:
+    """Emit the raw activity-item field names + MC-relevant values once per first trade,
+    so we can see exactly what GMGN provided vs. what the frontend displays."""
+    raw = getattr(trade, "raw", None)
+    if not isinstance(raw, dict):
+        return
+    token = raw.get("token") if isinstance(raw.get("token"), dict) else {}
+    keys = sorted(raw.keys())
+    mc_candidates = {k: raw.get(k) for k in keys if "cap" in k.lower() or "mc" in k.lower() or k in ("price_usd", "price", "cost_usd", "token_amount")}
+    token_mc = {k: token.get(k) for k in ("market_cap", "marketCap", "market_cap_usd", "marketcap", "total_supply", "max_supply", "circulating_supply", "supply") if k in token}
+    logger.warning(
+        "入场市值[RAW] event=%s keys=%s mc_fields=%s token_mc_fields=%s price_usd=%s total_supply_at_trade=%s row_market_cap=%s",
+        getattr(trade, "event_type", None),
+        keys,
+        mc_candidates,
+        token_mc,
+        trade.price_usd,
+        trade.total_supply_at_trade,
+        trade.market_cap,
+    )
 
 
 def _min_trade(trades: list[TradeRecord], event: EventType) -> Optional[TradeRecord]:
@@ -26,9 +51,16 @@ def _market_cap(trade: TradeRecord, info: Optional[TokenInfo]) -> tuple[Optional
         supply = info.circulating_supply or info.total_supply
         source = "token_info.current_supply"
         estimated = True
-    if trade.price_usd is None or supply is None:
-        return None, False, "GMGN 未提供历史市值所需价格或供给"
-    return trade.price_usd * supply, estimated, f"price_usd × {source}"
+    if trade.price_usd is not None and trade.price_usd > 0 and supply is not None:
+        return trade.price_usd * supply, estimated, f"price_usd × {source}"
+    # Transfer-in rows often have price_usd = 0 (no trade price). GMGN's drawer shows the
+    # token's CURRENT market cap on every row; mirror that by falling back to the current
+    # MC from token_info when no historical price is available.
+    if info is not None and info.market_cap is not None and info.market_cap > 0:
+        return info.market_cap, True, "token_info.current_market_cap"
+    if info is not None and info.fdv is not None and info.fdv > 0:
+        return info.fdv, True, "token_info.fdv"
+    return None, False, "GMGN 未提供历史市值所需价格或供给"
 
 
 def resolve_acquisition(
@@ -43,6 +75,21 @@ def resolve_acquisition(
 
     if first_buy is not None:
         market_cap, estimated, source = _market_cap(first_buy, token_info)
+        _dump_raw_fields(first_buy)
+        try:
+            logger.info(
+                "入场市值[BUY] token=%s tx=%s price_usd=%s supply=%s row_mc=%s info_mc=%s -> mc=%s via %s",
+                str(getattr(first_buy, "token_address", ""))[:8],
+                str(getattr(first_buy, "tx_hash", ""))[:10],
+                first_buy.price_usd,
+                first_buy.total_supply_at_trade,
+                first_buy.market_cap,
+                getattr(token_info, "market_cap", None),
+                market_cap,
+                source,
+            )
+        except Exception:
+            pass
         return AcquisitionInfo(
             acquisition_type=AcquisitionType.BUY,
             timestamp=first_buy.timestamp,
@@ -64,6 +111,22 @@ def resolve_acquisition(
 
     if first_in is not None:
         market_cap, estimated, source = _market_cap(first_in, token_info)
+        _dump_raw_fields(first_in)
+        try:
+            logger.info(
+                "入场市值[TRANSFER_IN] token=%s tx=%s price_usd=%s supply=%s row_mc=%s info_mc=%s info_fdv=%s -> mc=%s via %s",
+                str(getattr(first_in, "token_address", ""))[:8],
+                str(getattr(first_in, "tx_hash", ""))[:10],
+                first_in.price_usd,
+                first_in.total_supply_at_trade,
+                first_in.market_cap,
+                getattr(token_info, "market_cap", None),
+                getattr(token_info, "fdv", None),
+                market_cap,
+                source,
+            )
+        except Exception:
+            pass
         acq_type = AcquisitionType.TRANSFER_IN
         status = AcquisitionStatus.NO_BUY_HISTORY
         reason = "未发现 Buy，存在 TransferIn"

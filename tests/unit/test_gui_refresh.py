@@ -61,5 +61,33 @@ class RowPatchPlanTests(unittest.TestCase):
         self.assertEqual(plan["order"], ["c", "d"])
 
 
+class ProgressCountTests(unittest.TestCase):
+    def test_browser_logs_without_total_keep_token_bar(self):
+        from app.gui.components.progress_panel import coalesce_progress
+
+        done, total, sticky, count, frac = coalesce_progress("打开代币详情 STRID（3/23）", 3, 23, None)
+        self.assertEqual((done, total, count), (3, 23, "3 / 23"))
+        self.assertAlmostEqual(frac, 3 / 23)
+        done, total, sticky, count, frac = coalesce_progress("详情已打开（点名字）", 0, 0, sticky)
+        self.assertEqual((done, total, count), (3, 23, "3 / 23"))
+        self.assertAlmostEqual(frac, 3 / 23)
+
+    def test_running_without_counts_shows_in_progress_not_preparing(self):
+        from app.gui.components.progress_panel import coalesce_progress
+
+        done, total, sticky, count, frac = coalesce_progress("正在打开 GMGN 钱包页", 0, 0, None)
+        self.assertEqual(count, "进行中")
+        self.assertGreater(frac, 0)
+        self.assertIsNone(sticky)
+
+    def test_idle_clears_sticky(self):
+        from app.gui.components.progress_panel import coalesce_progress
+
+        _, _, sticky, count, frac = coalesce_progress("已取消", 0, 0, (4, 10))
+        self.assertIsNone(sticky)
+        self.assertEqual(count, "已取消")
+        self.assertEqual(frac, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

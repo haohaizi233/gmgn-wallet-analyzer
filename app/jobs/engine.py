@@ -141,14 +141,17 @@ class AnalysisJobEngine:
             headed = True if first is None else bool(getattr(first.options, "browser_headed", True))
             timeout = float(getattr(self.config, "gmgn_qr_login_timeout", 180) or 180)
 
-            def on_event(message: str) -> None:
+            def on_event(message: str, **extra) -> None:
                 self._emit(
                     job,
                     {
                         "type": "progress",
                         "message": message,
-                        "stage": "browser",
-                        "wallet": first.wallet_address if first else "",
+                        "stage": extra.get("stage") or "browser",
+                        "wallet": extra.get("wallet") or (first.wallet_address if first else ""),
+                        "done": int(extra.get("done") or 0),
+                        "total": int(extra.get("total") or 0),
+                        "token": extra.get("token") or "",
                     },
                 )
 

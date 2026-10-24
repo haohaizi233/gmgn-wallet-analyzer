@@ -45,5 +45,41 @@ class FifoTests(unittest.TestCase):
         self.assertEqual(result.current_balance, Decimal("10"))
 
 
+class UnrealizedRugGuardTests(unittest.TestCase):
+    def test_holding_below_market_cap_is_kept(self):
+        from app.services.wallet_analysis_service import _unrealized_profit
+        from app.domain.enums import FieldStatus
+
+        av = _unrealized_profit(Decimal("500"), Decimal("100"), Decimal("10000"), Decimal("5000"))
+        self.assertEqual(av.value, Decimal("400"))
+        self.assertIn(av.status, {FieldStatus.ESTIMATED, FieldStatus.KNOWN})
+
+    def test_holding_above_market_cap_is_rejected(self):
+        from app.services.wallet_analysis_service import _unrealized_profit
+        from app.domain.enums import FieldStatus
+
+        av = _unrealized_profit(Decimal("231000000"), Decimal("5800"), Decimal("5000"), Decimal("1000"))
+        self.assertIsNone(av.value)
+        self.assertEqual(av.status, FieldStatus.API_MISSING)
+        self.assertIn("代币市值", av.reason)
+
+    def test_holding_far_above_liquidity_is_rejected(self):
+        from app.services.wallet_analysis_service import _unrealized_profit
+        from app.domain.enums import FieldStatus
+
+        # MC missing, but liquidity tiny vs holding -> bogus
+        av = _unrealized_profit(Decimal("180000000"), Decimal("100"), None, Decimal("500"))
+        self.assertIsNone(av.value)
+        self.assertEqual(av.status, FieldStatus.API_MISSING)
+        self.assertIn("流动性", av.reason)
+
+    def test_low_liquidity_small_holding_is_kept(self):
+        from app.services.wallet_analysis_service import _unrealized_profit
+
+        # Low liquidity but holding also small -> not bogus
+        av = _unrealized_profit(Decimal("500"), Decimal("100"), None, Decimal("300"))
+        self.assertEqual(av.value, Decimal("400"))
+
+
 if __name__ == "__main__":
     unittest.main()
