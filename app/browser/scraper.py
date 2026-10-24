@@ -18,11 +18,12 @@ from app.browser.payloads import (
     extract_token_mints,
     oldest_activity_ts,
 )
+from app.browser.drawer_metrics import parse_drawer_metrics
 from app.browser import selectors as sel
 from app.utils.logger import get_logger
 
 logger = get_logger("gmgn.browser")
-OnEvent = Callable[[str], None]
+OnEvent = Callable[..., None]
 LOGIN_RETRY_GAP = 12.0
 BROWSER_CLOSED = "浏览器窗口被关掉了，采集中断"
 BROWSER_CLOSED_LOGIN = "浏览器窗口被关掉了，登录未完成"
@@ -31,6 +32,9 @@ ANNOUNCE_ACTIONS = (
     '.pi-modal button:has-text("Got it")',
     '.pi-modal button:has-text("Done")',
     '.pi-modal button:has-text("Start")',
+    '.pi-modal button:has-text("Finish")',
+    '.pi-modal button:has-text("完成")',
+    '.pi-modal button:has-text("我知道了")',
 )
 SCROLLER_BOX_JS = """() => {
     const activity = document.querySelector('[data-sentry-component="Activity"]');
@@ -208,6 +212,35 @@ LIST_SIGNATURE_JS = """() => {
         node = node.parentElement;
     }
     return [visible.length, label(visible[0]), label(visible[visible.length - 1]), Math.round(top)].join('|');
+}"""
+ACTIVITY_SCAN_JS = """() => {
+    const activity = document.querySelector('[data-sentry-component="Activity"]');
+    if (!activity) return {rows: 0, visible: 0, lastTime: '', names: []};
+    const rows = [...activity.querySelectorAll('tr.g-table-row')];
+    const visible = rows.filter((row) => {
+        const box = row.getBoundingClientRect();
+        return box.height > 4 && box.bottom > 0 && box.top < window.innerHeight;
+    });
+    const last = visible[visible.length - 1] || rows[rows.length - 1];
+    let lastTime = '';
+    const cells = last ? [...last.querySelectorAll('td')] : [];
+    for (const cell of cells) {
+        const t = (cell.innerText || '').replace(/\\s+/g, ' ').trim();
+        if (t && t.length < 28 && /(ago|刚刚|[0-9]+\\s*[smhd]|秒前|分钟前|小时前|天前)/i.test(t)) {
+            lastTime = t;
+        }
+    }
+    const names = [];
+    const seen = new Set();
+    for (const row of rows) {
+        const raw = ((row.innerText || '').split('\\n')[0] || '').trim();
+        const name = raw.replace(/^(Buy|Sell|Add|Remove|Transfer)\\s+/i, '').split(/\\s+/)[0];
+        if (name && !seen.has(name)) {
+            seen.add(name);
+            names.push(name);
+        }
+    }
+    return {rows: rows.length, visible: visible.length, lastTime, names};
 }"""
 RESET_SCROLL_JS = """() => {
     const activity = document.querySelector('[data-sentry-component="Activity"]');
@@ -421,9 +454,9 @@ def login_dialog_visible(page) -> bool:
 
 
 def dismiss_announcement_modal(page, emit: Optional[OnEvent] = None) -> int:
-    """Click Next on the GMGN update carousel. Never Escape — that also closes the login popup."""
+    """Click Next/Finish on the GMGN update carousel. Never Escape — that also closes the login popup."""
     clicks = 0
-    for step in range(6):
+    for step in range(8):
         if page_is_closed(page):
             raise BrowserSessionError(BROWSER_CLOSED)
         if not announcement_modal_visible(page):
@@ -434,12 +467,12 @@ def dismiss_announcement_modal(page, emit: Optional[OnEvent] = None) -> int:
             if not _any_visible(btn, limit=3):
                 continue
             if emit:
-                emit(f"关闭更新遮罩 Next（{step + 1}/4）")
+                emit(f"关闭更新遮罩（{step + 1}/8）")
             try:
                 btn.first.click(force=True, timeout=3000)
                 clicks += 1
                 clicked = True
-                _sleep_page(page, 350)
+                _sleep_page(page, 400)
                 break
             except Exception as exc:
                 if is_target_closed(exc):
@@ -465,7 +498,16 @@ def _sleep_page(page, ms: int) -> None:
 def require_logged_in(page, storage_state: dict[str, Any] | None) -> None:
     if announcement_modal_visible(page):
         raise BrowserSessionError("更新遮罩未关掉，登录按钮点不到")
-    if not is_logged_in(page):
+    for _ in range(4):
+        if is_logged_in(page) and not announcement_modal_visible(page):
+            break
+        dismiss_announcement_modal(page, None)
+        try:
+            page.wait_for_timeout(500)
+        except Exception as exc:
+            if is_target_closed(exc):
+                raise BrowserSessionError(BROWSER_CLOSED) from exc
+    else:
         raise BrowserSessionError("顶部仍是 Log In，没有切换成 Watchlist/头像")
     if not has_login_cookies(storage_state):
         raise BrowserSessionError("未拿到登录 Cookie，无法采集数据")
@@ -528,6 +570,7 @@ def wait_until_logged_in(
 ) -> bool:
     deadline = time.time() + timeout
     last_click = time.time()
+    confirm_hits = 0
     while time.time() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             raise AnalysisCancelledError()
@@ -543,8 +586,12 @@ def wait_until_logged_in(
             if is_target_closed(exc):
                 raise BrowserSessionError(BROWSER_CLOSED_LOGIN) from exc
             raise
-        if logged_in:
-            return True
+        if logged_in and not announcement:
+            confirm_hits += 1
+            if confirm_hits >= 2:
+                return True
+        else:
+            confirm_hits = 0
         now = time.time()
         if dialog:
             if emit and now - last_click >= LOGIN_RETRY_GAP:
@@ -564,6 +611,37 @@ def wait_until_logged_in(
         _sleep_page(page, 800)
     dismiss_announcement_modal(page, emit)
     return is_logged_in(page)
+
+
+def _unique_activity_labels(items: list[dict[str, Any]]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        for label in activity_token_labels(item):
+            if label not in seen:
+                seen.add(label)
+                ordered.append(label)
+    return ordered
+
+
+def window_scroll_progress(
+    start_ts: int,
+    oldest: int,
+    round_idx: int,
+    max_rounds: int,
+    now: int | None = None,
+) -> tuple[int, int]:
+    """Map activity-table scrolling onto a determinate 0–100 (or round) bar."""
+    if start_ts:
+        current = int(now if now is not None else time.time())
+        span = max(1, current - start_ts)
+        covered = max(0, current - oldest) if oldest else 0
+        done = min(99, int(100 * covered / span))
+        if oldest and oldest <= start_ts:
+            done = 100
+        return done, 100
+    total = max(1, int(max_rounds))
+    return min(round_idx + 1, total), total
 
 
 class CaptureBag:
@@ -627,10 +705,41 @@ class GmgnScraper:
         self._mint_labels: dict[str, list[str]] = {}
         self._wallet = ""
         self._capture_gen = 0
+        self._pg_done = 0
+        self._pg_total = 0
+        self._pg_token = ""
+        self._pg_stage = "browser"
+
+    def _set_progress(
+        self,
+        *,
+        done: int | None = None,
+        total: int | None = None,
+        token: str | None = None,
+        stage: str | None = None,
+    ) -> None:
+        if done is not None:
+            self._pg_done = int(done)
+        if total is not None:
+            self._pg_total = int(total)
+        if token is not None:
+            self._pg_token = str(token)
+        if stage is not None:
+            self._pg_stage = str(stage)
 
     def emit(self, message: str) -> None:
         logger.info(message)
-        if self.on_event:
+        if not self.on_event:
+            return
+        extra = {
+            "done": self._pg_done,
+            "total": self._pg_total,
+            "token": self._pg_token,
+            "stage": self._pg_stage,
+        }
+        try:
+            self.on_event(message, **extra)
+        except TypeError:
             self.on_event(message)
 
     def _check(self) -> None:
@@ -703,6 +812,7 @@ class GmgnScraper:
         self.capture.clear()
         self._token_details = {}
         self._mint_labels = {}
+        self._set_progress(done=0, total=0, token="", stage="browser")
 
     def open_wallet(self, wallet: str) -> None:
         self._check()
@@ -769,21 +879,49 @@ class GmgnScraper:
             dismiss_announcement_modal(page, self.emit)
 
     def scroll_until_coverage(self, start_ts: int, *, max_rounds: int = 80) -> list[dict[str, Any]]:
-        """Scroll first; do not open token drawers until the window is covered."""
+        """Scroll first; do not open token drawers until the window is covered.
+
+        The GMGN activity table loads rows into the DOM before the matching
+        ``wallet_activity`` JSON response is captured.  Stopping the moment the
+        oldest captured activity enters the window therefore misses the rows
+        that are visible on screen but whose API response has not arrived yet.
+
+        To avoid that, coverage is only declared when:
+        * the oldest captured activity is at or before ``start_ts`` AND
+        * the captured API count has caught up with the visible DOM rows AND
+        * that stable state holds for two consecutive rounds (debounce).
+        """
         self._check()
         self.attach()
         self._reveal_activity_table()
+        if start_ts:
+            from app.utils.time_utils import format_datetime
+
+            self.emit(f"下拉流水直到早于 {format_datetime(start_ts)}")
+        self._set_progress(done=0, total=100 if start_ts else max_rounds, token="", stage="browser_scroll")
         stagnant = 0
         last_count = -1
         last_oldest = 0
+        last_rows = -1
+        covered_confirms = 0
         for round_idx in range(max_rounds):
             self._check()
             activities = self.capture.activities()
             oldest = oldest_activity_ts(activities)
             count = len(activities)
             rows = self._row_count()
-            self.emit(f"下拉加载流水 round={round_idx + 1} 行={rows} 接口={count} oldest={oldest or '-'}")
-            covered = bool(start_ts and oldest and oldest <= start_ts)
+            labels = _unique_activity_labels(activities)
+            hint = self._activity_scan_hint()
+            tail = hint.get("lastTime") or "-"
+            recent = "、".join(labels[-8:]) if labels else "-"
+            visible_names = [str(x) for x in (hint.get("names") or []) if x]
+            visible = "、".join(visible_names[-6:]) if visible_names else "-"
+            done, total = window_scroll_progress(start_ts, oldest, round_idx, max_rounds)
+            self._set_progress(done=done, total=total, stage="browser_scroll")
+            self.emit(
+                f"下拉加载流水 round={round_idx + 1} 行={rows} 接口={count} "
+                f"oldest={oldest or '-'} 表尾={tail} 可见={visible} 接口代币={len(labels)} 最近={recent}"
+            )
             leftover = round_idx == 0 and rows > 0 and count > max(rows * 3, 80)
             if leftover:
                 self.emit("接口条数远大于当前表格，当作上一钱包残留，继续下拉")
@@ -792,26 +930,47 @@ class GmgnScraper:
                 stagnant = 0
                 last_count = -1
                 last_oldest = 0
+                covered_confirms = 0
                 continue
-            if covered:
-                self.emit("时间窗口已覆盖，停止下拉")
-                break
-            if count == last_count and oldest == last_oldest:
+            in_window = bool(start_ts and oldest and oldest <= start_ts)
+            api_caught_up = count >= rows or rows == 0
+            if in_window and api_caught_up:
+                covered_confirms += 1
+                if covered_confirms >= 2:
+                    self.emit(f"时间窗口已覆盖且接口已同步（{count} 条），停止下拉")
+                    break
+                self.emit(f"时间窗口已覆盖，确认第 {covered_confirms}/2 轮 接口={count} 行={rows}")
+            else:
+                covered_confirms = 0
+                if in_window and not api_caught_up:
+                    self.emit(f"接口落后于表格（接口={count} 行={rows}），继续下拉等接口同步")
+            if count == last_count and oldest == last_oldest and rows == last_rows:
                 stagnant += 1
             else:
                 stagnant = 0
             last_count = count
             last_oldest = oldest
+            last_rows = rows
             if stagnant == 3:
                 self._unstick_activity_scroll()
-            if stagnant >= 6:
-                self.emit("列表不再增长，停止下拉")
-                break
+            if stagnant >= 8:
+                if start_ts and (not oldest or oldest > start_ts):
+                    self.emit("列表停住但仍未盖住窗口，回滚再拉")
+                    self._unstick_activity_scroll()
+                    stagnant = 4
+                else:
+                    self.emit("列表不再增长，停止下拉")
+                    break
             self._wheel_activity(800)
             _sleep_page(self.page, 500)
             self._wheel_activity(500)
             _sleep_page(self.page, 800)
-        return self.capture.activities()
+        activities = self.capture.activities()
+        labels = _unique_activity_labels(activities)
+        preview = "、".join(labels[:40]) if labels else "无"
+        extra = f" 等{len(labels)}个" if len(labels) > 40 else ""
+        self.emit(f"流水已扫 {len(activities)} 条，表内代币 {len(labels)} 个：{preview}{extra}")
+        return activities
 
     def unique_tokens(self, activities: list[dict[str, Any]] | None = None) -> list[str]:
         items = activities if activities is not None else self.capture.activities()
@@ -857,12 +1016,29 @@ class GmgnScraper:
         _sleep_page(page, 900)
         self._scroll_drawer_until_complete(mint, shown)
         drawer_text = self._drawer_text()
+        drawer_metrics = parse_drawer_metrics(drawer_text)
+        if drawer_text:
+            logger.info(
+                "抽屉文本 %s 长度=%d 片段=%r total_profit=%s avg_mc_buy=%s bought=%s",
+                shown, len(drawer_text), drawer_text[:200], drawer_metrics.total_profit,
+                drawer_metrics.avg_mc_buy, drawer_metrics.bought_usd,
+            )
+            try:
+                from pathlib import Path as _P
+                _dbg = _P("data/raw/drawer_text_debug")
+                _dbg.mkdir(parents=True, exist_ok=True)
+                (_dbg / f"{mint[:12]}.txt").write_text(drawer_text, encoding="utf-8")
+            except Exception:
+                pass
+        else:
+            logger.info("抽屉文本为空 %s url=%s", shown, getattr(page, "url", ""))
         after = list(self.capture.by_kind.get("token") or [])
         payload = after[-1] if len(after) > before else {}
         detail = {
             "token_address": mint,
             "opened": True,
             "drawer_text": drawer_text,
+            "drawer_metrics": drawer_metrics,
             "payload": payload,
         }
         self._token_details[mint] = detail
@@ -1074,12 +1250,35 @@ class GmgnScraper:
                 pass
 
     def _drawer_text(self) -> str:
+        # The drawer may render as a .pi-drawer (full-page nav to /sol/token/<mint>)
+        # or as the DrawerToken sentry components. Try the same selectors the
+        # scroller uses first, then fall back to the sentry components, then to
+        # the page main content. Without .pi-drawer here the text comes back
+        # empty and every drawer metric column shows "GMGN 未提供".
+        selectors = [
+            ".pi-drawer",
+            "[class*='drawer-content']",
+            "[class*='drawer-body']",
+            sel.TOKEN_DRAWER,
+        ]
+        for sel_expr in selectors:
+            try:
+                loc = self.page.locator(sel_expr).first
+                if loc.count() and loc.is_visible():
+                    return loc.inner_text(timeout=3000)
+            except Exception as exc:
+                if is_target_closed(exc):
+                    raise BrowserSessionError(BROWSER_CLOSED) from exc
+                continue
+        # Last resort: token page main content (URL-based drawer).
         try:
-            loc = self.page.locator(sel.TOKEN_DRAWER).first
-            if loc.count() and loc.is_visible():
-                return loc.inner_text(timeout=3000)
-        except Exception:
-            pass
+            if "/sol/token/" in (self.page.url or ""):
+                loc = self.page.locator("main, [class*='token-detail'], [class*='token-info']").first
+                if loc.count() and loc.is_visible():
+                    return loc.inner_text(timeout=3000)
+        except Exception as exc:
+            if is_target_closed(exc):
+                raise BrowserSessionError(BROWSER_CLOSED) from exc
         return ""
 
     def _scroll_drawer_until_complete(self, mint: str, shown: str, *, max_rounds: int = 50) -> None:
@@ -1169,9 +1368,21 @@ class GmgnScraper:
 
     def _row_count(self) -> int:
         try:
-            return int(self.page.locator(sel.ACTION_TAG).count())
+            return int(self.page.locator(sel.ACTIVITY_ROW).count())
         except Exception:
-            return 0
+            try:
+                return int(self.page.locator("tr.g-table-row").count())
+            except Exception:
+                return 0
+
+    def _activity_scan_hint(self) -> dict[str, Any]:
+        try:
+            hint = self.page.evaluate(ACTIVITY_SCAN_JS)
+        except Exception as exc:
+            if is_target_closed(exc):
+                raise BrowserSessionError(BROWSER_CLOSED) from exc
+            return {}
+        return hint if isinstance(hint, dict) else {}
 
     def _scroller_box(self) -> dict[str, float] | None:
         try:

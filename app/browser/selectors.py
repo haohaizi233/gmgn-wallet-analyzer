@@ -15,7 +15,10 @@ ANNOUNCE_NEXT = (
     '.pi-modal button:has-text("Next"), '
     '.pi-modal button:has-text("Got it"), '
     '.pi-modal button:has-text("Done"), '
-    '.pi-modal button:has-text("Start")'
+    '.pi-modal button:has-text("Start"), '
+    '.pi-modal button:has-text("Finish"), '
+    '.pi-modal button:has-text("完成"), '
+    '.pi-modal button:has-text("我知道了")'
 )
 ADDRESS_CARD = '[data-sentry-component="NewAddressCard"]'
 ACTION_TAG = '[data-sentry-component="ActionTag"]'

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from app.api.parsers import as_dict, first_present, unwrap_payload
+from app.api.parsers import activity_token_address, as_dict, first_present, unwrap_payload
 
 TOKEN_HREF_RE = re.compile(r"/sol/token/([1-9A-HJ-NP-Za-km-z]{32,44})")
 ADDRESS_HREF_RE = re.compile(r"/sol/address/([1-9A-HJ-NP-Za-km-z]{32,44})")
@@ -72,12 +72,7 @@ def extract_activity_items(payload: Any) -> list[dict[str, Any]]:
 
 
 def _activity_key(item: dict[str, Any]) -> str:
-    token = as_dict(item.get("token"))
-    token_address = str(
-        first_present(item, "token_address", "base_address")
-        or first_present(token, "address", "token_address")
-        or ""
-    )
+    token_address = activity_token_address(item)
     tx = str(first_present(item, "tx_hash", "transaction_hash", "hash") or "")
     ts = str(first_present(item, "timestamp", "block_unix_time", "time") or "")
     side = str(first_present(item, "event_type", "type", "side") or "")
@@ -98,6 +93,18 @@ def activity_timestamp(item: dict[str, Any]) -> int:
 def oldest_activity_ts(items: list[dict[str, Any]]) -> int:
     stamps = [activity_timestamp(item) for item in items if activity_timestamp(item) > 0]
     return min(stamps) if stamps else 0
+
+
+def activity_in_window(item: dict[str, Any], start_ts: int, end_ts: int) -> bool:
+    """True when the activity timestamp sits inside the rolling report window."""
+    ts = activity_timestamp(item)
+    if not ts:
+        return not bool(start_ts)
+    if start_ts and ts < start_ts:
+        return False
+    if end_ts and ts > end_ts:
+        return False
+    return True
 
 
 def activity_token_labels(item: dict[str, Any]) -> list[str]:
@@ -135,10 +142,7 @@ def extract_token_mints(*blobs: Any) -> list[str]:
                 add(match)
             continue
         if isinstance(blob, dict):
-            token = as_dict(blob.get("token"))
-            add(str(first_present(blob, "token_address", "base_address", "address") or ""))
-            add(str(first_present(token, "address", "token_address") or ""))
-            add(str(blob.get("token_address") or ""))
+            add(activity_token_address(blob))
             continue
         if isinstance(blob, list):
             for item in blob:

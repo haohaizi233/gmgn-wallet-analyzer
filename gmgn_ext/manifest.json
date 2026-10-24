@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "GMGN 钱包买入采集器",
+  "version": "1.0.0",
+  "description": "在已登录的 GMGN 页面上采集钱包买入记录，含面板总利润/总利润率",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["https://gmgn.ai/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "GMGN 钱包买入采集器"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://gmgn.ai/*"],
+      "js": ["content_script.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
